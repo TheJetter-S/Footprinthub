@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Python & Virtual Environments
+.venv/
+backend/.venv/
+venv/
+env/
+ENV/
+__pycache__/
+backend/app/**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment Variables & Local Secrets
+.env
+*.env
+!.env.example
+
+# Local SQLite databases
+*.db
+*.sqlite3
+backend/footprinthub.db
+
+# Build outputs & caches
+dist/
+frontend/dist/
+build/
+*.tsbuildinfo
+
+# Docker Desktop WSL artifacts
+DockerDesktopWSL/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
