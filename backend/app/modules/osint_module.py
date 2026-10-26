@@ -9,12 +9,20 @@
 
 import asyncio
 import hashlib
+import html
 import re
 import urllib.parse
 from typing import Any, Optional
 import httpx
 
 from app.config import settings
+from app.modules.osint_helpers import (
+    SocialMediaScraper,
+    CompanyMetadataScraper,
+    LinkedInOSINTEngine,
+    CompanyDigitalFootprintEngine,
+    WebsiteIntelligenceEngine,
+)
 from app.modules.base import (
     BaseModule,
     FindingSeverity,
@@ -169,14 +177,9 @@ class BehindTheEmailEngine:
             first_name = tokens[0].capitalize()
             last_name = tokens[1].capitalize()
         else:
-            # Single word like 'jsmith' or 'alex'
-            if len(local) > 4 and local[0].isalpha() and local[1:].isalpha():
-                # Potential first-initial + last name (e.g. jsmith -> J. Smith)
-                first_name = local[0].upper() + "."
-                last_name = local[1:].capitalize()
-            else:
-                first_name = local.capitalize()
-                last_name = ""
+            # Single word like 'ramadevi' or 'alex'
+            first_name = local.capitalize()
+            last_name = ""
 
         full_name = f"{first_name} {last_name}".strip()
 
@@ -535,7 +538,7 @@ class OSINTModule(BaseModule):
     name: str = "osint"
     description: str = "Corporate email discovery, Behind the Email identity lookup, LinkedIn profiling, breach checks, and Google Dorks"
     mode: ModuleMode = ModuleMode.PASSIVE
-    timeout: int = 40
+    timeout: int = 60
 
     async def run(
         self,
@@ -544,203 +547,411 @@ class OSINTModule(BaseModule):
     ) -> ModuleResult:
         findings: list[ModuleFinding] = []
         emails_found: set[str] = set()
+        all_crawled_html: str = ""
 
-        company_name = BehindTheEmailEngine.infer_company_name(target)
+        # Normalize target domain and base domain
+        clean_target = target.lower().strip().replace("https://", "").replace("http://", "").rstrip("/")
+        base_domain = clean_target.replace("www.", "")
 
-        self._progress(on_progress, 15, f"Crawling public surfaces & security manifests for {target}...")
+        company_name = BehindTheEmailEngine.infer_company_name(base_domain)
 
-        # Scrape multiple public paths for corporate emails
+        self._progress(on_progress, 8, f"Crawling public surfaces, team pages & manifest for {clean_target}...")
+
+        # Scrape multiple public paths for corporate emails, team info, and social profiles
         paths_to_crawl = [
             "",
-            "/contact",
-            "/contact-us",
             "/about",
             "/about-us",
             "/team",
+            "/leadership",
+            "/people",
+            "/company",
+            "/contact",
+            "/contact-us",
+            "/our-team",
+            "/founders",
             "/.well-known/security.txt",
         ]
 
-        async with httpx.AsyncClient(timeout=4.5, follow_redirects=True, verify=False) as client:
-            for path in paths_to_crawl:
+        # Use a persistent client with realistic browser headers and generous timeout for CDNs / slow hosts
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        client = httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False, headers=headers)
+        try:
+            # 1. Fetch homepage first to discover internal links dynamically (e.g. /about-us, /our-team)
+            homepage_html = ""
+            for probe_host in [clean_target, base_domain]:
                 try:
-                    url = f"https://{target}{path}"
-                    resp = await client.get(url)
-                    if resp.status_code == 200:
-                        # Extract any emails belonging to target domain
-                        found = re.findall(rf"[a-zA-Z0-9_.+-]+@{re.escape(target)}", resp.text)
-                        for e in found:
-                            emails_found.add(e.lower().strip())
-                        # Also catch general contact emails if explicitly stated
-                        general = re.findall(r"(?:info|contact|support|security|sales|admin)@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", resp.text)
-                        for g in general:
-                            if target in g:
-                                emails_found.add(g.lower().strip())
+                    resp = await client.get(f"https://{probe_host}/")
+                    if resp.status_code == 200 and resp.text:
+                        homepage_html = resp.text
+                        all_crawled_html += homepage_html + "\n"
+                        break
                 except Exception:
-                    continue
+                    pass
+            if not homepage_html:
+                for probe_host in [clean_target, base_domain]:
+                    try:
+                        resp = await client.get(f"http://{probe_host}/")
+                        if resp.status_code == 200 and resp.text:
+                            homepage_html = resp.text
+                            all_crawled_html += homepage_html + "\n"
+                            break
+                    except Exception:
+                        pass
 
-        # Hunter.io API if key configured
-        hunter_key = getattr(settings, "HUNTER_IO_API_KEY", None)
-        if hunter_key:
-            self._progress(on_progress, 35, "Querying Hunter.io email database...")
+            # Dynamically discover navigation links from homepage
+            if homepage_html:
+                raw_hrefs = re.findall(r'href=["\']([^"\']+)["\']', homepage_html, re.I)
+                escaped_hrefs = re.findall(r'["\'](/[^"\']+|https?://[^"\']+)["\']', homepage_html)
+                all_raw_links = raw_hrefs + [h.replace(r"\/", "/") for h in escaped_hrefs]
+                for raw_link in all_raw_links:
+                    raw_link = raw_link.strip()
+                    lower_link = raw_link.lower()
+                    if any(kw in lower_link for kw in ["about", "team", "founder", "people", "leadership", "contact", "company", "who-we-are"]):
+                        if raw_link.startswith("/") and not raw_link.startswith("//"):
+                            path_only = raw_link.split("?")[0].split("#")[0]
+                            if path_only and path_only not in paths_to_crawl:
+                                paths_to_crawl.append(path_only)
+                        elif clean_target in lower_link or base_domain in lower_link:
+                            try:
+                                parsed = urllib.parse.urlparse(raw_link)
+                                if parsed.path and parsed.path not in paths_to_crawl:
+                                    paths_to_crawl.append(parsed.path)
+                            except Exception:
+                                pass
+
+            # Crawl remaining paths concurrently in batches of 4
+            remaining_paths = [p for p in paths_to_crawl if p != ""]
+            async def _crawl_path(path: str) -> str:
+                for host in [clean_target, base_domain]:
+                    try:
+                        url = f"https://{host}{path}"
+                        resp = await client.get(url)
+                        if resp.status_code == 200 and resp.text:
+                            return resp.text
+                    except Exception:
+                        pass
+                return ""
+
+            batch_size = 4
+            for i in range(0, len(remaining_paths), batch_size):
+                batch = remaining_paths[i:i + batch_size]
+                results_batch = await asyncio.gather(*[_crawl_path(p) for p in batch])
+                for h_text in results_batch:
+                    if h_text:
+                        all_crawled_html += h_text + "\n"
+
+            # Normalize all crawled HTML (strip json-escaped slashes \/ and html entities)
+            normalized_html = all_crawled_html.replace(r"\/", "/")
             try:
-                async with httpx.AsyncClient(timeout=6.0) as client:
-                    resp = await client.get(f"https://api.hunter.io/v2/domain-search?domain={target}&api_key={hunter_key}")
+                normalized_html = html.unescape(normalized_html)
+            except Exception:
+                pass
+
+            def _clean_email(em: str) -> str:
+                em = em.lower().strip()
+                # Strip unicode escape residue such as u202f, u003e, gt, lt, etc.
+                em = re.sub(r'^(?:u[0-9a-f]{4}|gt|lt|quot|amp)+', '', em)
+                return em.strip("._- ")
+
+            # Extract emails from normalized crawled HTML
+            found = re.findall(rf"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)*{re.escape(base_domain)}", normalized_html, re.I)
+            for e in found:
+                cleaned = _clean_email(e)
+                if "@" in cleaned and len(cleaned.split("@")[0]) > 1:
+                    emails_found.add(cleaned)
+
+            # Mailto links
+            mailtos = re.findall(r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", normalized_html, re.I)
+            for m in mailtos:
+                clean_m = _clean_email(m)
+                if base_domain in clean_m and "@" in clean_m and len(clean_m.split("@")[0]) > 1:
+                    emails_found.add(clean_m)
+
+            general = re.findall(r"(?:info|contact|support|security|sales|admin|team|hello|founder|techsupport)@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", normalized_html, re.I)
+            for g in general:
+                clean_g = _clean_email(g)
+                if base_domain in clean_g and "@" in clean_g and len(clean_g.split("@")[0]) > 1:
+                    emails_found.add(clean_g)
+
+            # ── Extract Social Media Profiles from Website HTML ─────────────────
+            self._progress(on_progress, 20, "Extracting official social media profiles from website...")
+            website_social_profiles = SocialMediaScraper.extract_social_links(normalized_html)
+
+            # ── Extract Company Metadata, JSON-LD & Team Members ───────────────
+            self._progress(on_progress, 25, "Parsing company metadata, schema registers & leadership...")
+            company_meta = CompanyMetadataScraper.extract_company_metadata(normalized_html, base_domain, company_name)
+            if company_meta.get("name") and company_meta["name"] != company_name:
+                company_name = company_meta["name"]
+
+            # Merge any contact emails discovered in company_meta into emails_found
+            for c_em in company_meta.get("contact_emails", []):
+                if base_domain in c_em:
+                    emails_found.add(c_em.lower().strip())
+
+            # ── GitHub Organization / User Intelligence ─────────────────────────
+            github_intel: dict[str, Any] = {}
+            github_handles = [p["handle"] for p in website_social_profiles if p["platform"] == "GitHub"]
+            if github_handles:
+                self._progress(on_progress, 32, f"Gathering GitHub intelligence for @{github_handles[0]}...")
+                github_intel = await SocialMediaScraper.gather_github_intelligence(
+                    github_handles[0], client,
+                    github_token=getattr(settings, "GITHUB_TOKEN", None),
+                )
+                if github_intel.get("members"):
+                    findings.append(
+                        ModuleFinding(
+                            severity=FindingSeverity.INFO,
+                            title=f"GitHub Organization Members Exposed ({len(github_intel['members'])} public)",
+                            description=(
+                                f"The GitHub organization @{github_handles[0]} has {len(github_intel['members'])} "
+                                f"publicly visible members. Member profiles may reveal employee names, emails, "
+                                f"locations, and technology stack preferences."
+                            ),
+                            remediation="Review GitHub organization member visibility settings. Consider making member list private if not required.",
+                        )
+                    )
+
+            if website_social_profiles:
+                platforms_found = sorted(set(p["platform"] for p in website_social_profiles))
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.INFO,
+                        title=f"Social Media Footprint Discovered ({len(website_social_profiles)} profiles)",
+                        description=(
+                            f"Found {len(website_social_profiles)} social media profiles on {clean_target}: "
+                            + ", ".join(platforms_found)
+                            + ". These expose organizational structure, employees, and contact info."
+                        ),
+                        remediation="Audit publicly linked social media profiles. Ensure employee privacy settings are configured appropriately.",
+                    )
+                )
+
+            # Hunter.io API if key configured
+            hunter_key = getattr(settings, "HUNTER_IO_API_KEY", None)
+            if hunter_key:
+                self._progress(on_progress, 40, "Querying Hunter.io email database...")
+                try:
+                    resp = await client.get(f"https://api.hunter.io/v2/domain-search?domain={base_domain}&api_key={hunter_key}", timeout=6.0)
                     if resp.status_code == 200:
                         h_data = resp.json().get("data", {})
                         for em in h_data.get("emails", []):
                             emails_found.add(em.get("value", "").lower())
+                except Exception:
+                    pass
+
+            # Synthesize corporate probes if none found
+            synthesized_probes = [
+                f"contact@{base_domain}",
+                f"admin@{base_domain}",
+                f"security@{base_domain}",
+                f"support@{base_domain}",
+                f"info@{base_domain}",
+            ]
+            if not emails_found:
+                for p in synthesized_probes[:3]:
+                    emails_found.add(p)
+
+            self._progress(on_progress, 52, "Executing Behind the Email profile enrichment & social discovery...")
+
+            # Run Behind the Email engine on the discovered emails concurrently
+            behind_the_email_profiles: list[dict[str, Any]] = []
+            enrichment_tasks = [
+                BehindTheEmailEngine.enrich_email(em, company_hint=company_name)
+                for em in list(emails_found)[:6]
+            ]
+            if enrichment_tasks:
+                results = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
+                for res in results:
+                    if isinstance(res, dict):
+                        behind_the_email_profiles.append(res)
+
+            # Check if any emails have critical breach exposures
+            breached_count = 0
+            for prof in behind_the_email_profiles:
+                b_info = prof.get("breach_checks", {})
+                if b_info.get("pwned"):
+                    breached_count += 1
+
+            if breached_count > 0:
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.HIGH,
+                        title=f"Corporate Identities Discovered in Historical Data Breaches ({breached_count} affected)",
+                        description=(
+                            f"Behind the Email intelligence detected {breached_count} corporate email identities associated with {clean_target} "
+                            "in known historical breaches and credential leaks (e.g. LinkedIn Scraping, Corporate Combo Lists). "
+                            "Compromised attributes include password hashes, email addresses, and professional contact info."
+                        ),
+                        remediation="Enforce mandatory Multi-Factor Authentication (MFA/2FA) on all corporate email accounts and require password resets.",
+                    )
+                )
+
+            if emails_found:
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.INFO,
+                        title=f"Public Corporate Identities & Email Footprint ({len(emails_found)} detected)",
+                        description=f"Publicly accessible corporate identities identified for {clean_target}: {', '.join(list(emails_found)[:5])}.",
+                        remediation="Train staff on spear-phishing awareness and avoid publishing personal employee email addresses directly in cleartext HTML.",
+                    )
+                )
+
+            self._progress(on_progress, 72, "Compiling LinkedIn Corporate Intelligence, Employee Directory & Founders...")
+
+            # ── LinkedIn Corporate Intelligence Engine ──────────────────────────
+            linkedin_intelligence = LinkedInOSINTEngine.build_linkedin_intelligence(
+                domain=base_domain,
+                company_name=company_name,
+                website_social_profiles=website_social_profiles,
+                company_meta=company_meta,
+                github_intel=github_intel,
+                enriched_email_profiles=behind_the_email_profiles,
+            )
+
+            # ── Digital Footprint & Registries Engine ───────────────────────────
+            self._progress(on_progress, 78, "Aggregating public registers and corporate digital footprint...")
+            digital_footprint = CompanyDigitalFootprintEngine.build_digital_footprint(
+                domain=base_domain,
+                company_name=company_name,
+                website_social_profiles=website_social_profiles,
+                company_meta=company_meta,
+            )
+
+            # ── Wayback Machine & Internet-Wide Intelligence ────────────────────
+            self._progress(on_progress, 84, "Querying Wayback Machine and aggregating internet-wide intelligence...")
+            try:
+                wayback_data = await WebsiteIntelligenceEngine.gather_wayback_intelligence(
+                    domain=base_domain, client=client
+                )
             except Exception:
-                pass
-
-        # If 0 or very few emails were detected on raw HTML, synthesize standard corporate role probes
-        # to ensure the user gets actionable OSINT footprinting for the target organization
-        synthesized_probes = [
-            f"contact@{target}",
-            f"admin@{target}",
-            f"security@{target}",
-            f"support@{target}",
-            f"info@{target}",
-        ]
-        if not emails_found:
-            for p in synthesized_probes[:3]:
-                emails_found.add(p)
-
-        self._progress(on_progress, 50, "Executing Behind the Email profile enrichment & social discovery...")
-
-        # Run Behind the Email engine on the discovered emails concurrently
-        behind_the_email_profiles: list[dict[str, Any]] = []
-        enrichment_tasks = [
-            BehindTheEmailEngine.enrich_email(em, company_hint=company_name)
-            for em in list(emails_found)[:6]
-        ]
-        if enrichment_tasks:
-            results = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, dict):
-                    behind_the_email_profiles.append(res)
-
-        # Check if any emails have critical breach exposures
-        breached_count = 0
-        for prof in behind_the_email_profiles:
-            b_info = prof.get("breach_checks", {})
-            if b_info.get("pwned"):
-                breached_count += 1
-
-        if breached_count > 0:
-            findings.append(
-                ModuleFinding(
-                    severity=FindingSeverity.HIGH,
-                    title=f"Corporate Identities Discovered in Historical Data Breaches ({breached_count} affected)",
-                    description=(
-                        f"Behind the Email intelligence detected {breached_count} corporate email identities associated with {target} "
-                        "in known historical breaches and credential leaks (e.g. LinkedIn Scraping, Corporate Combo Lists). "
-                        "Compromised attributes include password hashes, email addresses, and professional contact info."
-                    ),
-                    remediation="Enforce mandatory Multi-Factor Authentication (MFA/2FA) on all corporate email accounts and require password resets.",
-                )
+                wayback_data = {"available": False, "total_snapshots": 0}
+            internet_intelligence = WebsiteIntelligenceEngine.build_internet_intelligence(
+                domain=base_domain,
+                company_name=company_name,
+                company_meta=company_meta,
+                website_social_profiles=website_social_profiles,
+                wayback_data=wayback_data,
             )
 
-        if emails_found:
-            findings.append(
-                ModuleFinding(
-                    severity=FindingSeverity.INFO,
-                    title=f"Public Corporate Identities & Email Footprint ({len(emails_found)} detected)",
-                    description=f"Publicly accessible corporate identities identified for {target}: {', '.join(list(emails_found)[:5])}.",
-                    remediation="Train staff on spear-phishing awareness and avoid publishing personal employee email addresses directly in cleartext HTML.",
+            # Findings for Wayback Machine
+            if wayback_data.get("available"):
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.INFO,
+                        title=f"Wayback Machine Historical Snapshots Available",
+                        description=(
+                            f"The domain {clean_target} has been archived by the Wayback Machine with "
+                            f"{wayback_data.get('total_snapshots', 0)} historical snapshots. "
+                            f"Domain age estimate: {internet_intelligence.get('domain_age_estimate', 'Unknown')}. "
+                            "Archived snapshots may reveal previous site versions, leaked endpoints, "
+                            "or deprecated technologies."
+                        ),
+                        remediation="Review archived snapshots for sensitive content and ensure deprecated resources are properly removed.",
+                    )
                 )
+
+            # Findings for Executive Leadership & Employees
+            founders_list = linkedin_intelligence.get("founders", [])
+            if founders_list:
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.INFO,
+                        title=f"Executive Leadership & Founders Identified ({len(founders_list)} profiles)",
+                        description=(
+                            f"Identified leadership and key executive personnel for {company_name}: "
+                            + ", ".join([f"{f['name']} ({f['title']})" for f in founders_list[:4]])
+                            + ". Public executive identities are high-value targets for spear-phishing and business email compromise (BEC)."
+                        ),
+                        remediation="Conduct executive security protection briefings and implement anti-spoofing controls (DMARC, DKIM, SPF).",
+                    )
+                )
+
+            emp_count = linkedin_intelligence.get("employee_count", 0)
+            if emp_count > 0:
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.INFO,
+                        title=f"Employee Directory & Public Profiles ({emp_count} detected)",
+                        description=(
+                            f"Enumerated {emp_count} employee and team footprints across website pages, "
+                            "LinkedIn profiles, GitHub organizations, and corporate identities."
+                        ),
+                        remediation="Educate employees on social engineering risks and ensure corporate credentials are not reused across public platforms.",
+                    )
+                )
+
+            google_dorks = [
+                {
+                    "category": "Exposed Documents & Spreadsheets",
+                    "dork": f"site:{base_domain} ext:doc OR ext:docx OR ext:pdf OR ext:xls OR ext:xlsx",
+                    "url": f"https://www.google.com/search?q=site:{base_domain}+ext:doc+OR+ext:docx+OR+ext:pdf+OR+ext:xls+OR+ext:xlsx",
+                },
+                {
+                    "category": "Administrative Portals",
+                    "dork": f"site:{base_domain} inurl:admin OR inurl:login OR inurl:portal",
+                    "url": f"https://www.google.com/search?q=site:{base_domain}+inurl:admin+OR+inurl:login+OR+inurl:portal",
+                },
+                {
+                    "category": "Directory Listings",
+                    "dork": f"site:{base_domain} intitle:\"index of\"",
+                    "url": f"https://www.google.com/search?q=site:{base_domain}+intitle:%22index+of%22",
+                },
+                {
+                    "category": "Configuration & Backup Files",
+                    "dork": f"site:{base_domain} ext:xml OR ext:conf OR ext:cnf OR ext:reg OR ext:inf OR ext:rdp OR ext:cfg OR ext:txt OR ext:bak",
+                    "url": f"https://www.google.com/search?q=site:{base_domain}+ext:xml+OR+ext:conf+OR+ext:cfg+OR+ext:bak",
+                },
+                {
+                    "category": "Confidential / Internal Keywords",
+                    "dork": f"site:{base_domain} \"confidential\" OR \"not for public release\" OR \"internal use only\"",
+                    "url": f"https://www.google.com/search?q=site:{base_domain}+%22confidential%22+OR+%22internal+use+only%22",
+                },
+            ]
+
+            self._progress(on_progress, 92, "Checking GitHub leak references...")
+            github_queries = [
+                {
+                    "description": f"Code mentioning {base_domain} with password/secret",
+                    "query": f'"{base_domain}" password OR secret OR api_key',
+                    "url": f"https://github.com/search?q=%22{base_domain}%22+password+OR+secret+OR+api_key&type=code",
+                },
+                {
+                    "description": f"Configuration files referencing {base_domain}",
+                    "query": f'"{base_domain}" filename:.env OR filename:config.json',
+                    "url": f"https://github.com/search?q=%22{base_domain}%22+filename%3A.env+OR+filename%3Aconfig.json&type=code",
+                },
+            ]
+
+            self._progress(on_progress, 100, "OSINT reconnaissance completed")
+
+            return ModuleResult(
+                module_name=self.name,
+                mode=self.mode,
+                status="success",
+                data={
+                    "target": target,
+                    "domain": base_domain,
+                    "company_name": company_name,
+                    "company_metadata": company_meta,
+                    "digital_footprint": digital_footprint,
+                    "internet_intelligence": internet_intelligence,
+                    "linkedin_intelligence": linkedin_intelligence,
+                    "founders": founders_list,
+                    "employees": linkedin_intelligence.get("employees", []),
+                    "employee_count": emp_count,
+                    "website_social_profiles": website_social_profiles,
+                    "github_intelligence": github_intel,
+                    "behind_the_email": behind_the_email_profiles,
+                    "emails": list(emails_found),
+                    "google_dorks": google_dorks,
+                    "github_recon": github_queries,
+                },
+                findings=findings,
             )
-
-        self._progress(on_progress, 75, "Generating LinkedIn Corporate Intelligence & targeted Google Dorks...")
-
-        # LinkedIn Corporate Intelligence Dorks
-        linkedin_intelligence = {
-            "company_name": company_name,
-            "company_search_url": f"https://www.linkedin.com/search/results/companies/?keywords={urllib.parse.quote(company_name)}",
-            "detected_email_pattern": f"{{first}}.{{last}}@{target}",
-            "dorks": [
-                {
-                    "role_category": "All Company Personnel",
-                    "description": f"Enumerate all registered LinkedIn profiles at {company_name}",
-                    "dork": f"site:linkedin.com/in/ \"{company_name}\"",
-                    "url": f"https://www.google.com/search?q=site:linkedin.com/in/+\"{urllib.parse.quote(company_name)}\"",
-                },
-                {
-                    "role_category": "Executive Leadership & Board",
-                    "description": f"C-Suite executives (CEO, CTO, CFO, Founder, Director) at {company_name}",
-                    "dork": f"site:linkedin.com/in/ \"{company_name}\" (CEO OR CTO OR CFO OR \"Chief\" OR Director OR Founder OR VP)",
-                    "url": f"https://www.google.com/search?q=site:linkedin.com/in/+\"{urllib.parse.quote(company_name)}\"+(CEO+OR+CTO+OR+CFO+OR+\"Chief\"+OR+Director+OR+Founder+OR+VP)",
-                },
-                {
-                    "role_category": "Information Security & IT",
-                    "description": f"Security engineers, CISO, Sysadmins, and DevOps staff at {company_name}",
-                    "dork": f"site:linkedin.com/in/ \"{company_name}\" (\"Security\" OR \"IT\" OR \"DevOps\" OR \"Sysadmin\" OR \"CISO\" OR \"Cloud\")",
-                    "url": f"https://www.google.com/search?q=site:linkedin.com/in/+\"{urllib.parse.quote(company_name)}\"+(\"Security\"+OR+\"IT\"+OR+\"DevOps\"+OR+\"Sysadmin\"+OR+\"CISO\"+OR+\"Cloud\")",
-                },
-                {
-                    "role_category": "Software Engineering & Tech Stack",
-                    "description": f"Software engineers, developers, and architects disclosing stack details",
-                    "dork": f"site:linkedin.com/in/ \"{company_name}\" (\"Software Engineer\" OR \"Developer\" OR \"Architect\")",
-                    "url": f"https://www.google.com/search?q=site:linkedin.com/in/+\"{urllib.parse.quote(company_name)}\"+(\"Software+Engineer\"+OR+\"Developer\"+OR+\"Architect\")",
-                },
-            ],
-        }
-
-        google_dorks = [
-            {
-                "category": "Exposed Documents & Spreadsheets",
-                "dork": f"site:{target} ext:doc OR ext:docx OR ext:pdf OR ext:xls OR ext:xlsx",
-                "url": f"https://www.google.com/search?q=site:{target}+ext:doc+OR+ext:docx+OR+ext:pdf+OR+ext:xls+OR+ext:xlsx",
-            },
-            {
-                "category": "Administrative Portals",
-                "dork": f"site:{target} inurl:admin OR inurl:login OR inurl:portal",
-                "url": f"https://www.google.com/search?q=site:{target}+inurl:admin+OR+inurl:login+OR+inurl:portal",
-            },
-            {
-                "category": "Directory Listings",
-                "dork": f"site:{target} intitle:\"index of\"",
-                "url": f"https://www.google.com/search?q=site:{target}+intitle:%22index+of%22",
-            },
-            {
-                "category": "Configuration & Backup Files",
-                "dork": f"site:{target} ext:xml OR ext:conf OR ext:cnf OR ext:reg OR ext:inf OR ext:rdp OR ext:cfg OR ext:txt OR ext:bak",
-                "url": f"https://www.google.com/search?q=site:{target}+ext:xml+OR+ext:conf+OR+ext:cfg+OR+ext:bak",
-            },
-            {
-                "category": "Confidential / Internal Keywords",
-                "dork": f"site:{target} \"confidential\" OR \"not for public release\" OR \"internal use only\"",
-                "url": f"https://www.google.com/search?q=site:{target}+%22confidential%22+OR+%22internal+use+only%22",
-            },
-        ]
-
-        self._progress(on_progress, 90, "Checking GitHub leak references...")
-        github_queries = [
-            {
-                "description": f"Code mentioning {target} with password/secret",
-                "query": f'"{target}" password OR secret OR api_key',
-                "url": f"https://github.com/search?q=%22{target}%22+password+OR+secret+OR+api_key&type=code",
-            },
-            {
-                "description": f"Configuration files referencing {target}",
-                "query": f'"{target}" filename:.env OR filename:config.json',
-                "url": f"https://github.com/search?q=%22{target}%22+filename%3A.env+OR+filename%3Aconfig.json&type=code",
-            },
-        ]
-
-        self._progress(on_progress, 100, "OSINT reconnaissance completed")
-
-        return ModuleResult(
-            module_name=self.name,
-            mode=self.mode,
-            status="success",
-            data={
-                "target": target,
-                "company_name": company_name,
-                "emails": list(emails_found),
-                "behind_the_email": behind_the_email_profiles,
-                "linkedin_intelligence": linkedin_intelligence,
-                "google_dorks": google_dorks,
-                "github_recon": github_queries,
-            },
-            findings=findings,
-        )
+        finally:
+            await client.aclose()

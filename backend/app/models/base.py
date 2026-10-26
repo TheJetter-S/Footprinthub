@@ -5,7 +5,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, func
+from sqlalchemy import DateTime, func, event
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -13,13 +13,28 @@ from app.config import settings
 
 # ── Async Engine & Session ───────────────────────────────────────────────────
 engine_kwargs = {"echo": False}  # Set to True for SQL debugging
-if "sqlite" not in settings.DATABASE_URL:
+if "sqlite" in settings.DATABASE_URL:
+    engine_kwargs.update({
+        "connect_args": {"timeout": 30.0, "check_same_thread": False}
+    })
+else:
     engine_kwargs.update({"pool_size": 20, "max_overflow": 10})
 
 engine = create_async_engine(
     settings.DATABASE_URL,
     **engine_kwargs,
 )
+
+if "sqlite" in settings.DATABASE_URL:
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
+        except Exception:
+            pass
 
 async_session_factory = async_sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False

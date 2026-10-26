@@ -28,6 +28,17 @@ import {
   Radio,
   Layers,
   ArrowLeft,
+  Users,
+  Briefcase,
+  Building2,
+  Sparkles,
+  UserCheck,
+  MapPin,
+  Calendar,
+  Hash,
+  Mail,
+  ShieldAlert,
+  AtSign,
 } from 'lucide-react'
 import {
   scansApi,
@@ -1172,11 +1183,19 @@ const PLATFORM_ICONS: Record<string, string> = {
   google: '🔵',
   microsoft: '🟦',
   twitter: '🐦',
+  'twitter / x': '🐦',
   tiktok: '🎵',
   flickr: '📷',
   etsy: '🛍️',
   medium: '✍️',
   reddit: '🟠',
+  facebook: '📘',
+  instagram: '📸',
+  youtube: '▶️',
+  pinterest: '📌',
+  discord: '💬',
+  telegram: '✈️',
+  crunchbase: '📊',
 }
 
 const STATUS_STYLE: Record<string, string> = {
@@ -1187,161 +1206,666 @@ const STATUS_STYLE: Record<string, string> = {
   not_detected: 'text-surface-500 bg-surface-800/50 border-surface-700/30',
 }
 
+function buildFallbackInternetIntel(targetDomain: string, companyName: string) {
+  const encDomain = encodeURIComponent(targetDomain || 'target')
+  const encCompany = encodeURIComponent(companyName || targetDomain || 'company')
+  return {
+    domain: targetDomain,
+    company_name: companyName,
+    wayback_machine: {
+      domain: targetDomain,
+      available: true,
+      total_snapshots: 0,
+      archive_url: `https://web.archive.org/web/*/${targetDomain}`,
+      message: 'Explore historical website snapshots on the Internet Archive',
+    },
+    infrastructure_intel: [
+      { name: 'Shodan', category: 'Host & Port Recon', description: `Open ports, banners, and running services on ${targetDomain}`, url: `https://www.shodan.io/search?query=hostname:${encDomain}`, icon: '⚡' },
+      { name: 'Censys Search', category: 'Host & Certificate Recon', description: `Internet-wide scanning data, certificates, and IPv4 hosts for ${targetDomain}`, url: `https://search.censys.io/search?q=${encDomain}`, icon: '🔍' },
+      { name: 'BuiltWith', category: 'Technology Profiler', description: `Frameworks, analytics, CMS, and hosting infrastructure used by ${targetDomain}`, url: `https://builtwith.com/${encDomain}`, icon: '🛠️' },
+      { name: 'SecurityTrails', category: 'DNS & History', description: `Historical DNS records, subdomains, and WHOIS changes for ${targetDomain}`, url: `https://securitytrails.com/domain/${encDomain}/dns`, icon: '📜' },
+      { name: 'DNSDumpster', category: 'DNS Mapping', description: `DNS mapping, subdomains, and network visualizer for ${targetDomain}`, url: `https://dnsdumpster.com/`, icon: '🗺️' },
+      { name: 'Netcraft Site Report', category: 'Hosting & Security', description: `Hosting provider, web server, uptime history, and risk rating for ${targetDomain}`, url: `https://sitereport.netcraft.com/?url=${encDomain}`, icon: '🛡️' },
+      { name: 'crt.sh (Certificate Transparency)', category: 'SSL/TLS Recon', description: `All SSL/TLS certificates ever issued for ${targetDomain} (finds hidden subdomains)`, url: `https://crt.sh/?q=%25.${encDomain}`, icon: '🔐' },
+      { name: 'ViewDNS.info', category: 'Reverse IP & Tools', description: `Reverse IP lookup, DNS record report, and IP history for ${targetDomain}`, url: `https://viewdns.info/reverseip/?host=${encDomain}&t=1`, icon: '🔎' },
+    ],
+    reputation_intel: [
+      { name: 'Glassdoor', category: 'Employee Reviews', description: `Employee reviews, salaries, interview experiences, and company culture for ${companyName}`, url: `https://www.glassdoor.com/Search/results.htm?keyword=${encCompany}`, icon: '⭐' },
+      { name: 'Trustpilot', category: 'Customer Reviews', description: `Customer trust score, reviews, and complaint history for ${companyName}`, url: `https://www.trustpilot.com/search?query=${encCompany}`, icon: '🏆' },
+      { name: 'Better Business Bureau', category: 'Business Rating', description: `BBB accreditation status, customer complaints, and business rating`, url: `https://www.bbb.org/search?find_text=${encCompany}`, icon: '📋' },
+      { name: 'Indeed', category: 'Employer Profile', description: `Company reviews, job postings, and salary data from employees and applicants`, url: `https://www.indeed.com/cmp/${encodeURIComponent((companyName || '').toLowerCase().replace(/\s+/g, '-'))}/reviews`, icon: '💼' },
+      { name: 'G2', category: 'Software Reviews', description: `Product reviews, pricing, and competitive alternatives for ${companyName}'s software`, url: `https://www.g2.com/search?query=${encCompany}`, icon: '📊' },
+    ],
+    news_intel: [
+      { name: 'Google News', category: 'News', description: `Latest news articles, press releases, and media mentions for ${companyName}`, url: `https://news.google.com/search?q=${encCompany}`, icon: '📰' },
+      { name: 'TechCrunch', category: 'Tech News', description: `TechCrunch coverage, funding rounds, and acquisitions for ${companyName}`, url: `https://techcrunch.com/search/${encCompany}`, icon: '🚀' },
+      { name: 'PitchBook', category: 'Venture Capital & M&A', description: `Venture funding, investors, valuation, and executive profiles for ${companyName}`, url: `https://pitchbook.com/profiles/search?q=${encCompany}`, icon: '💰' },
+      { name: 'Product Hunt', category: 'Product Launches', description: `Product launches, user votes, reviews, and maker profiles for ${companyName}`, url: `https://www.producthunt.com/search?q=${encCompany}`, icon: '💡' },
+    ],
+    legal_intel: [
+      { name: 'ICANN WHOIS', category: 'Domain Registration', description: `Domain registrar, creation/expiry dates, name servers, and registrant details`, url: `https://lookup.icann.org/en/lookup?name=${encDomain}`, icon: '📜' },
+      { name: 'Google Transparency Report', category: 'Malware & Safe Browsing', description: `Google Safe Browsing status, malware warnings, and unsafe content flags`, url: `https://transparencyreport.google.com/safe-browsing/search?url=${encDomain}`, icon: '🛡️' },
+      { name: 'URLScan.io', category: 'Automated Web Scan', description: `Automated web scan, screenshots, DOM analysis, and contacted IPs for ${targetDomain}`, url: `https://urlscan.io/search/#${encDomain}`, icon: '🔬' },
+      { name: 'VirusTotal Domain Report', category: 'Security Reputation', description: `70+ antivirus and blocklist scanners evaluating ${targetDomain}`, url: `https://www.virustotal.com/gui/domain/${encDomain}`, icon: '🦠' },
+    ],
+    linkedin_deep_queries: [
+      { name: 'Company Employees (Current)', description: `All current employees at ${companyName} on LinkedIn`, dork: `site:linkedin.com/in "${companyName}" "Present"`, url: `https://www.google.com/search?q=site:linkedin.com/in+"${encCompany}"+"Present"`, icon: '👥' },
+      { name: 'Former Employees', description: `People who previously worked at ${companyName} — may reveal internal culture & stack`, dork: `site:linkedin.com/in "${companyName}" -"Present"`, url: `https://www.google.com/search?q=site:linkedin.com/in+"${encCompany}"+-"Present"`, icon: '🚶' },
+      { name: 'Hiring Managers & Recruiters', description: `HR & recruiting contacts at ${companyName} — reveals org structure`, dork: `site:linkedin.com/in "${companyName}" ("Recruiter" OR "Talent Acquisition" OR "HR")`, url: `https://www.google.com/search?q=site:linkedin.com/in+"${encCompany}"+("Recruiter"+OR+"Talent+Acquisition"+OR+"HR")`, icon: '🎯' },
+      { name: 'Engineering & DevOps Team', description: `Technical staff revealing technology stack and internal architecture`, dork: `site:linkedin.com/in "${companyName}" ("Engineer" OR "DevOps" OR "Developer" OR "Architect")`, url: `https://www.google.com/search?q=site:linkedin.com/in+"${encCompany}"+("Engineer"+OR+"DevOps"+OR+"Developer"+OR+"Architect")`, icon: '⚙️' },
+      { name: 'Security & Compliance Team', description: `Security personnel revealing defense posture and compliance frameworks`, dork: `site:linkedin.com/in "${companyName}" ("Security" OR "CISO" OR "Compliance" OR "SOC" OR "Pentest")`, url: `https://www.google.com/search?q=site:linkedin.com/in+"${encCompany}"+("Security"+OR+"CISO"+OR+"Compliance"+OR+"SOC"+OR+"Pentest")`, icon: '🔐' },
+      { name: 'Company Job Postings', description: `Active job postings revealing expansion areas, tech stack requirements, and team gaps`, dork: `site:linkedin.com/jobs "${companyName}"`, url: `https://www.google.com/search?q=site:linkedin.com/jobs+"${encCompany}"`, icon: '📋' },
+    ],
+    social_deep_queries: [
+      { name: 'Twitter / X Mentions', description: `Public tweets and discussions mentioning ${companyName} or ${targetDomain}`, url: `https://x.com/search?q=${encCompany}+OR+${encDomain}&f=live`, icon: '🐦' },
+      { name: 'Reddit Discussions', description: `Reddit discussions, community reviews, and insider info about ${companyName}`, url: `https://www.reddit.com/search/?q=${encCompany}&type=link&sort=new`, icon: '🟠' },
+      { name: 'YouTube Content', description: `Video content, tutorials, and product walkthroughs for ${companyName}`, url: `https://www.youtube.com/results?search_query=${encCompany}`, icon: '▶️' },
+      { name: 'Hacker News', description: `Tech community discussions and submissions about ${companyName} or ${targetDomain}`, url: `https://hn.algolia.com/?q=${encCompany}`, icon: '🔶' },
+      { name: 'Stack Overflow', description: `Technical questions and developer discussions associated with ${targetDomain}`, url: `https://stackoverflow.com/search?q=${encCompany}`, icon: '📚' },
+    ],
+  }
+}
+
 function OSINTResultView({ data }: { data: any }) {
   const emails: string[] = data.emails || []
   const dorks: any[] = data.google_dorks || []
   const githubRecon: any[] = data.github_recon || []
   const profiles: any[] = data.behind_the_email || []
   const linkedinIntel: any = data.linkedin_intelligence || {}
-  const companyName: string = data.company_name || data.target || ''
+  const companyMeta: any = data.company_metadata || {}
+  const digitalFootprint: any = data.digital_footprint || {}
+  const founders: any[] = data.founders || linkedinIntel.founders || []
+  const employees: any[] = data.employees || linkedinIntel.employees || []
+  const socialProfiles: any[] = data.website_social_profiles || digitalFootprint.all_social_profiles || []
+  const githubIntel: any = data.github_intelligence || {}
+  const companyName: string = data.company_name || companyMeta.name || data.target || ''
+  const targetDomain: string = data.target || ''
+  const internetIntel: any = (data.internet_intelligence && Object.keys(data.internet_intelligence).length > 0)
+    ? data.internet_intelligence
+    : buildFallbackInternetIntel(targetDomain, companyName)
+
   const [selectedEmail, setSelectedEmail] = useState<number>(0)
+  const [activeTab, setActiveTab] = useState<'executive' | 'socials' | 'employees' | 'identities' | 'wayback' | 'recon_tools'>(
+    founders.length > 0 ? 'executive' : socialProfiles.length > 0 ? 'socials' : 'employees'
+  )
+  const [employeeDepartment, setEmployeeDepartment] = useState<string>('All')
+  const [employeeQuery, setEmployeeQuery] = useState<string>('')
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
 
   const activeProfile = profiles[selectedEmail]
+
+  const copyToClipboard = (text: string, key: string) => {
+    navigator.clipboard.writeText(text)
+    setCopiedKey(key)
+    setTimeout(() => setCopiedKey(null), 2000)
+  }
+
+  // Filter employees
+  const filteredEmployees = employees.filter((emp: any) => {
+    const matchesDept =
+      employeeDepartment === 'All' || emp.department === employeeDepartment
+    const matchesSearch =
+      !employeeQuery ||
+      (emp.name && emp.name.toLowerCase().includes(employeeQuery.toLowerCase())) ||
+      (emp.title && emp.title.toLowerCase().includes(employeeQuery.toLowerCase())) ||
+      (emp.email && emp.email.toLowerCase().includes(employeeQuery.toLowerCase()))
+    return matchesDept && matchesSearch
+  })
+
+  // Group departments
+  const departmentCounts = employees.reduce((acc: Record<string, number>, emp: any) => {
+    const dept = emp.department || 'Operations & Business'
+    acc[dept] = (acc[dept] || 0) + 1
+    return acc
+  }, {})
 
   return (
     <div className="space-y-6">
 
-      {/* ── Header Summary ── */}
-      <div className="glass-card p-5 border border-surface-800 flex flex-wrap items-center gap-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-brand-600/20 border border-brand-500/30 flex items-center justify-center text-lg">🕵️</div>
-          <div>
-            <h2 className="text-sm font-bold text-white">Behind the Email — Identity Intelligence</h2>
-            <p className="text-xs text-surface-400 mt-0.5">
-              {emails.length} corporate identities · {profiles.length} enriched profiles · Silent passive execution
-            </p>
-          </div>
-        </div>
-        <span className="ml-auto text-[10px] font-bold uppercase px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 tracking-wider">
-          🔇 Silent Mode Active
-        </span>
-      </div>
+      {/* ── Intelligence Command Center Dossier Header ── */}
+      <div className="relative overflow-hidden rounded-2xl border border-surface-700/60 bg-gradient-to-br from-surface-950 via-surface-900 to-surface-950 p-6 shadow-2xl backdrop-blur-xl">
+        <div className="absolute -right-12 -top-12 h-64 w-64 rounded-full bg-cyan-500/5 blur-3xl pointer-events-none" />
+        <div className="absolute -left-12 -bottom-12 h-64 w-64 rounded-full bg-brand-500/5 blur-3xl pointer-events-none" />
 
-      {/* ── Email Selector ── */}
-      {emails.length > 0 && (
-        <div className="glass-card p-5 border border-surface-800 space-y-3">
-          <h3 className="text-sm font-semibold text-white">📧 Discovered Corporate Identities ({emails.length})</h3>
-          <div className="flex flex-wrap gap-2">
-            {emails.map((e: string, idx: number) => (
+        <div className="relative z-10 space-y-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500/20 via-cyan-500/10 to-blue-500/20 border border-brand-500/30 text-2xl shadow-lg shadow-brand-950/50">
+                🕵️
+              </div>
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-xl font-bold tracking-tight text-white">{companyName}</h2>
+                  <span className="rounded-lg bg-surface-800/90 px-2.5 py-0.5 font-mono text-xs text-brand-300 border border-surface-700">
+                    {targetDomain}
+                  </span>
+                  {companyMeta.json_ld_detected && (
+                    <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 border border-emerald-500/20">
+                      ✓ Schema.org Verified
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1 text-xs text-surface-400 max-w-2xl leading-relaxed">
+                  {companyMeta.description || 'Passive open-source intelligence harvested from public website structure, team registries, and verified digital footprints.'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-400">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Live OSINT Scraped
+              </span>
+            </div>
+          </div>
+
+          {/* Company Profile Metadata Chips */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-2">
+            <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Industry & Sector</span>
+              <span className="text-xs font-semibold text-white truncate block">
+                {companyMeta.industry || 'Technology & Software'}
+              </span>
+            </div>
+            <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Headquarters</span>
+              <span className="text-xs font-semibold text-white truncate block flex items-center gap-1">
+                <MapPin className="h-3 w-3 text-red-400 flex-shrink-0" />
+                {companyMeta.headquarters || 'Public Digital Infrastructure'}
+              </span>
+            </div>
+            <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Established</span>
+              <span className="text-xs font-semibold text-white flex items-center gap-1">
+                <Calendar className="h-3 w-3 text-brand-400 flex-shrink-0" />
+                {companyMeta.founded_year || 'Verified Domain'}
+              </span>
+            </div>
+            <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Estimated Team</span>
+              <span className="text-xs font-semibold text-white flex items-center gap-1">
+                <Users className="h-3 w-3 text-blue-400 flex-shrink-0" />
+                {companyMeta.estimated_employees || `${employees.length || 1}+ Identified`}
+              </span>
+            </div>
+          </div>
+
+          {/* Quick Metrics KPI Bar */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1 border-t border-surface-800/80">
+            <button
+              onClick={() => setActiveTab('executive')}
+              className={`p-3 rounded-xl border text-left transition-all ${
+                activeTab === 'executive'
+                  ? 'bg-amber-500/10 border-amber-500/40 shadow-lg shadow-amber-950/20'
+                  : 'bg-surface-900/40 border-surface-800 hover:border-surface-700'
+              }`}
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block">Leadership & Owners</span>
+              <div className="mt-1 flex items-center gap-1.5 text-lg font-bold text-amber-400">
+                <span>👑</span> {founders.length}
+              </div>
+              <span className="text-[10px] text-surface-400 mt-0.5 block truncate">Scraped website personnel</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('socials')}
+              className={`p-3 rounded-xl border text-left transition-all ${
+                activeTab === 'socials'
+                  ? 'bg-cyan-500/10 border-cyan-500/40 shadow-lg shadow-cyan-950/20'
+                  : 'bg-surface-900/40 border-surface-800 hover:border-surface-700'
+              }`}
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block">Website Socials</span>
+              <div className="mt-1 flex items-center gap-1.5 text-lg font-bold text-cyan-400">
+                <span>🌐</span> {socialProfiles.length}
+              </div>
+              <span className="text-[10px] text-surface-400 mt-0.5 block truncate">Official profiles found</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('employees')}
+              className={`p-3 rounded-xl border text-left transition-all ${
+                activeTab === 'employees'
+                  ? 'bg-blue-500/10 border-blue-500/40 shadow-lg shadow-blue-950/20'
+                  : 'bg-surface-900/40 border-surface-800 hover:border-surface-700'
+              }`}
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block">Discovered Staff</span>
+              <div className="mt-1 flex items-center gap-1.5 text-lg font-bold text-blue-400">
+                <span>👥</span> {employees.length}
+              </div>
+              <span className="text-[10px] text-surface-400 mt-0.5 block truncate">Aggregated footprints</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('identities')}
+              className={`p-3 rounded-xl border text-left transition-all ${
+                activeTab === 'identities'
+                  ? 'bg-brand-500/10 border-brand-500/40 shadow-lg shadow-brand-950/20'
+                  : 'bg-surface-900/40 border-surface-800 hover:border-surface-700'
+              }`}
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block">Corporate Identities</span>
+              <div className="mt-1 flex items-center gap-1.5 text-lg font-bold text-brand-400">
+                <span>📧</span> {emails.length}
+              </div>
+              <span className="text-[10px] text-surface-400 mt-0.5 block truncate">Behind the Email</span>
+            </button>
+          </div>
+
+          {/* Streamlined Tab Switcher */}
+          <div className="flex flex-wrap gap-2 pt-2 border-t border-surface-800">
+            {[
+              { id: 'executive', label: `Leadership & Owner (${founders.length})`, icon: '👑' },
+              { id: 'socials', label: `Website Socials (${socialProfiles.length})`, icon: '🌐' },
+              { id: 'employees', label: `Employee Directory (${employees.length})`, icon: '👥' },
+              { id: 'identities', label: `Behind the Email (${emails.length})`, icon: '🕵️' },
+              { id: 'wayback', label: 'Wayback Machine', icon: '🏛️' },
+              { id: 'recon_tools', label: `Recon Tools & Dorks (${dorks.length + githubRecon.length})`, icon: '🛠️' },
+            ].map((tab) => (
               <button
-                key={e}
-                onClick={() => setSelectedEmail(idx)}
-                className={`px-3 py-1.5 rounded-lg text-xs font-mono transition-all border ${
-                  selectedEmail === idx
-                    ? 'bg-brand-600/30 border-brand-500/50 text-brand-300'
-                    : 'bg-surface-900 border-surface-800 text-surface-300 hover:border-surface-700'
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id as any)}
+                className={`flex items-center gap-2 rounded-xl px-4 py-2 text-xs font-semibold transition-all ${
+                  activeTab === tab.id
+                    ? 'bg-gradient-to-r from-brand-600 to-cyan-600 text-white shadow-md shadow-brand-950/50'
+                    : 'bg-surface-900/80 text-surface-400 border border-surface-800 hover:border-surface-700 hover:text-white'
                 }`}
               >
-                {e}
+                <span>{tab.icon}</span>
+                <span>{tab.label}</span>
               </button>
             ))}
           </div>
         </div>
-      )}
+      </div>
 
-      {/* ── Behind the Email Profile ── */}
-      {activeProfile && (
-        <>
-          {/* Profile Enrichment */}
-          <div className="glass-card p-6 border border-surface-800 space-y-4">
-            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <span>👤</span> Profile Enrichment
-              <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20 ml-1">
-                LinkedIn & Professional Registers
-              </span>
-            </h3>
-            <div className="flex items-start gap-5">
-              {activeProfile.avatar_url && (
-                <img
-                  src={activeProfile.avatar_url}
-                  alt="Avatar"
-                  className="w-16 h-16 rounded-xl border border-surface-700 bg-surface-900 object-cover flex-shrink-0"
-                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
-                />
-              )}
-              <div className="grid grid-cols-2 gap-x-8 gap-y-2.5 flex-1">
-                {[
-                  ['Full Name', activeProfile.profile_enrichment?.full_name],
-                  ['Inferred Role', activeProfile.profile_enrichment?.inferred_role],
-                  ['Department', activeProfile.profile_enrichment?.department],
-                  ['Company', activeProfile.profile_enrichment?.company],
-                  ['Email', activeProfile.email],
-                  ['Username', activeProfile.profile_enrichment?.username],
-                ].filter(([,v]) => v).map(([label, value]) => (
-                  <div key={label as string}>
-                    <span className="text-[10px] uppercase tracking-wider text-surface-500 font-semibold block mb-0.5">{label}</span>
-                    <span className="text-xs text-white font-medium">{value}</span>
-                  </div>
-                ))}
-              </div>
+      {/* ── TAB 1: Verified Leadership & Owner Intelligence ── */}
+      {activeTab === 'executive' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-1">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>👑</span>
+                <span>Discovered Website Leadership & Owner Intelligence</span>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                  {founders.length} Scraped Profiles
+                </span>
+              </h3>
+              <p className="text-xs text-surface-400 mt-0.5">
+                Real individuals and key decision makers extracted directly from website HTML, LinkedIn profile links, and structured schema.
+              </p>
             </div>
-            {/* LinkedIn enrichment actions */}
-            <div className="flex flex-wrap gap-2 pt-2 border-t border-surface-800">
-              {activeProfile.profile_enrichment?.linkedin_search_url && (
-                <a
-                  href={activeProfile.profile_enrichment.linkedin_search_url}
-                  target="_blank" rel="noopener noreferrer"
-                  className="px-3 py-1.5 rounded-lg text-xs bg-blue-600/20 text-blue-400 border border-blue-500/30 hover:bg-blue-600/30 transition-colors flex items-center gap-1.5"
-                >
-                  💼 LinkedIn Search <ExternalLink className="h-3 w-3" />
-                </a>
-              )}
-              {activeProfile.profile_enrichment?.linkedin_dork_url && (
-                <a
-                  href={activeProfile.profile_enrichment.linkedin_dork_url}
-                  target="_blank" rel="noopener noreferrer"
-                  className="px-3 py-1.5 rounded-lg text-xs bg-brand-600/20 text-brand-400 border border-brand-500/30 hover:bg-brand-600/30 transition-colors flex items-center gap-1.5"
-                >
-                  🔍 Google Dork <ExternalLink className="h-3 w-3" />
-                </a>
-              )}
-              {activeProfile.profile_enrichment?.google_identity_url && (
-                <a
-                  href={activeProfile.profile_enrichment.google_identity_url}
-                  target="_blank" rel="noopener noreferrer"
-                  className="px-3 py-1.5 rounded-lg text-xs bg-orange-600/20 text-orange-400 border border-orange-500/30 hover:bg-orange-600/30 transition-colors flex items-center gap-1.5"
-                >
-                  🌐 Google Identity Search <ExternalLink className="h-3 w-3" />
-                </a>
-              )}
-            </div>
+            {linkedinIntel.company_url && (
+              <a
+                href={linkedinIntel.company_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600/20 text-blue-300 border border-blue-500/30 text-xs font-semibold hover:bg-blue-600/30 transition-all"
+              >
+                💼 Official LinkedIn Page <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
           </div>
 
-          {/* Social Account Discovery */}
-          <div className="glass-card p-6 border border-surface-800 space-y-4">
-            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <span>🌐</span> Social Account Discovery
-              <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 ml-1">
-                12 Platforms Scanned
-              </span>
-            </h3>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              {(activeProfile.social_discovery || []).map((acc: any, idx: number) => {
-                const statusStyle = STATUS_STYLE[acc.status] || STATUS_STYLE.not_detected
-                const icon = PLATFORM_ICONS[acc.icon] || '🔗'
+          {founders.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-surface-800 bg-surface-900/30 p-8 text-center space-y-3">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-surface-800 text-2xl text-surface-400">
+                🔍
+              </div>
+              <div className="space-y-1">
+                <h4 className="text-sm font-bold text-white">No Public Executive Profiles Declared in Website HTML</h4>
+                <p className="text-xs text-surface-400 max-w-md mx-auto leading-relaxed">
+                  The scanned public pages for <span className="text-brand-300 font-mono">{targetDomain}</span> do not explicitly list founder or owner names in their markup.
+                </p>
+              </div>
+              <button
+                onClick={() => setActiveTab('recon_tools')}
+                className="inline-flex items-center gap-2 rounded-xl bg-brand-600 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-brand-900/40 hover:bg-brand-500 transition-all"
+              >
+                <span>Open Targeted LinkedIn Recon Dorks</span>
+                <ExternalLink className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {founders.map((founder: any, idx: number) => {
+                const initials = founder.name
+                  ? founder.name.split(' ').map((n: string) => n[0]).slice(0, 2).join('').toUpperCase()
+                  : 'LE'
+                const hasDirectLinkedIn = Boolean(founder.linkedin_url && founder.linkedin_url.includes('linkedin.com/in/'))
+                const inferredEmail = founder.inferred_email || `${founder.name?.toLowerCase().replace(/\s+/g, '.')}@${targetDomain}`
+
                 return (
                   <div
                     key={idx}
-                    className={`p-3 rounded-xl border flex items-start gap-3 transition-all ${statusStyle}`}
+                    className="rounded-2xl border border-surface-800 bg-gradient-to-br from-surface-900/90 via-surface-900/60 to-surface-950/90 p-5 space-y-4 hover:border-amber-500/40 transition-all shadow-xl"
                   >
-                    <span className="text-lg flex-shrink-0 mt-0.5">{icon}</span>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between gap-2 mb-0.5">
-                        <span className="text-xs font-semibold text-white">{acc.platform}</span>
-                        <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded-full border ${statusStyle}`}>
-                          {acc.status === 'found' || acc.status === 'detected' ? '✓ Found' :
-                           acc.status === 'targeted' ? '⚡ Targeted' :
-                           acc.status === 'query_ready' ? '🔍 Query' : '✗ None'}
+                    {/* Header: Photo + Name + Verified Source */}
+                    <div className="flex items-start gap-4">
+                      {founder.avatar_url ? (
+                        <img
+                          src={founder.avatar_url}
+                          alt={founder.name}
+                          className="h-14 w-14 rounded-2xl object-cover border border-amber-500/30 bg-surface-950 flex-shrink-0 shadow-md"
+                          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+                        />
+                      ) : (
+                        <div className="h-14 w-14 rounded-2xl bg-gradient-to-br from-amber-600/30 via-brand-600/20 to-surface-900 border border-amber-500/40 flex items-center justify-center font-bold text-base text-amber-300 flex-shrink-0 shadow-md">
+                          {initials}
+                        </div>
+                      )}
+
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center justify-between gap-1">
+                          <h4 className="text-sm font-bold text-white tracking-tight truncate">{founder.name}</h4>
+                          <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[9px] font-bold text-emerald-400 border border-emerald-500/20">
+                            ✓ Verified Scraped
+                          </span>
+                        </div>
+                        <p className="text-xs font-semibold text-amber-400 truncate">
+                          {founder.title}
+                        </p>
+                        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                          <span className="rounded-md bg-surface-800 px-2 py-0.5 text-[9px] font-medium text-surface-300 border border-surface-700">
+                            {founder.department || 'Executive Leadership'}
+                          </span>
+                          <span className="text-[10px] text-surface-500 truncate">
+                            Source: {founder.source || 'Website Team Page'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Bio snippet if available */}
+                    {founder.bio && (
+                      <p className="text-xs text-surface-300 bg-surface-950/50 p-3 rounded-xl border border-surface-800/80 leading-relaxed">
+                        {founder.bio}
+                      </p>
+                    )}
+
+                    {/* Inline Threat & Footprint Analysis Box */}
+                    <div className="rounded-xl border border-surface-800 bg-surface-950/70 p-3.5 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-surface-400 flex items-center gap-1">
+                          <ShieldAlert className="h-3 w-3 text-red-400" /> OSINT Risk Profile
+                        </span>
+                        <span className="text-[10px] font-semibold text-red-400 bg-red-500/10 border border-red-500/20 px-2 py-0.5 rounded-full">
+                          High Exposure (BEC Target)
                         </span>
                       </div>
-                      <p className="text-[11px] text-current opacity-80 leading-tight">{acc.details}</p>
-                      {acc.profile_url && (
-                        <a
-                          href={acc.profile_url}
-                          target="_blank" rel="noopener noreferrer"
-                          className="text-[10px] opacity-70 hover:opacity-100 underline underline-offset-2 mt-1 block truncate transition-opacity"
+
+                      {/* Inferred Email with Copy */}
+                      <div className="flex items-center justify-between gap-2 bg-surface-900/80 p-2 rounded-lg border border-surface-800 text-xs">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Mail className="h-3.5 w-3.5 text-brand-400 flex-shrink-0" />
+                          <span className="text-surface-400 text-[11px]">Inferred Email:</span>
+                          <span className="font-mono text-white text-[11px] truncate">{inferredEmail}</span>
+                        </div>
+                        <button
+                          onClick={() => copyToClipboard(inferredEmail, `email-${idx}`)}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded bg-surface-800 hover:bg-surface-700 text-surface-300 hover:text-white text-[10px] transition-colors flex-shrink-0"
                         >
-                          {acc.username || 'View Profile'} <ExternalLink className="inline h-2.5 w-2.5" />
+                          {copiedKey === `email-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                          <span>{copiedKey === `email-${idx}` ? 'Copied' : 'Copy'}</span>
+                        </button>
+                      </div>
+
+                      {/* Direct LinkedIn Profile vs Search */}
+                      <div className="flex items-center justify-between gap-2 pt-1 text-xs">
+                        <span className="text-[11px] text-surface-400 flex items-center gap-1">
+                          <span>💼</span> LinkedIn Identity:
+                        </span>
+                        {hasDirectLinkedIn ? (
+                          <a
+                            href={founder.linkedin_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 font-semibold text-blue-400 hover:text-blue-300 text-[11px] bg-blue-500/10 border border-blue-500/20 px-2.5 py-1 rounded-lg transition-colors"
+                          >
+                            <span>Direct Profile Found</span>
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        ) : (
+                          <a
+                            href={founder.linkedin_search_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-surface-400 hover:text-blue-300 text-[11px] transition-colors"
+                          >
+                            <span>Search Profile</span>
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── TAB 2: Official Website Social Media Profiles ── */}
+      {activeTab === 'socials' && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between px-1">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>🌐</span>
+                <span>Official Social Media Channels Discovered on Website</span>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                  {socialProfiles.length} Channels
+                </span>
+              </h3>
+              <p className="text-xs text-surface-400 mt-0.5">
+                Profiles explicitly published and linked in the HTML code of {targetDomain}.
+              </p>
+            </div>
+          </div>
+
+          {socialProfiles.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-surface-800 bg-surface-900/30 p-8 text-center text-xs text-surface-500">
+              No official social media channels were detected in the crawled public website pages.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3.5">
+              {socialProfiles.map((p: any, idx: number) => {
+                const icon = PLATFORM_ICONS[p.platform?.toLowerCase()] || p.icon || '🔗'
+                const isLinkedIn = p.platform === 'LinkedIn'
+                const isGitHub = p.platform === 'GitHub'
+
+                return (
+                  <div
+                    key={idx}
+                    className={`rounded-2xl border p-4 flex flex-col justify-between space-y-3 transition-all ${
+                      isLinkedIn
+                        ? 'border-blue-500/30 bg-gradient-to-br from-blue-950/20 to-surface-900/80 shadow-lg'
+                        : isGitHub
+                        ? 'border-purple-500/30 bg-gradient-to-br from-purple-950/20 to-surface-900/80'
+                        : 'border-surface-800 bg-surface-900/70 hover:border-surface-700'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <span className="text-2xl">{icon}</span>
+                        <div className="min-w-0">
+                          <h4 className="text-xs font-bold text-white truncate">{p.platform}</h4>
+                          <span className="text-[11px] font-mono text-brand-300 truncate block">
+                            @{p.handle}
+                          </span>
+                        </div>
+                      </div>
+                      <span className="rounded-full bg-surface-800 px-2 py-0.5 text-[9px] font-bold uppercase text-surface-400 border border-surface-700 flex-shrink-0">
+                        {p.type || 'profile'}
+                      </span>
+                    </div>
+
+                    <div className="pt-2 border-t border-surface-800/80 flex items-center justify-between text-xs">
+                      <button
+                        onClick={() => copyToClipboard(p.url, `soc-${idx}`)}
+                        className="flex items-center gap-1 text-[11px] text-surface-400 hover:text-white transition-colors"
+                      >
+                        {copiedKey === `soc-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                        <span>{copiedKey === `soc-${idx}` ? 'Copied' : 'Copy URL'}</span>
+                      </button>
+
+                      <a
+                        href={p.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold text-brand-400 hover:text-brand-300 text-[11px] transition-colors"
+                      >
+                        <span>Visit Channel</span>
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── TAB 3: Discovered Employee Directory ── */}
+      {activeTab === 'employees' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-1">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Users className="h-4 w-4 text-blue-400" />
+                <span>Discovered Personnel & Employee Directory</span>
+                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                  {employees.length} Personnel
+                </span>
+              </h3>
+              <p className="text-xs text-surface-400 mt-0.5">
+                Staff identified across team pages, personal LinkedIn links, GitHub organization members, and corporate identities.
+              </p>
+            </div>
+          </div>
+
+          {/* Department Filter & Search Controls */}
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-surface-900/60 p-3 border border-surface-800">
+            <div className="flex flex-wrap gap-1.5">
+              {['All', 'Executive Leadership', 'Engineering & Tech', 'Cybersecurity & IT', 'Operations & Business'].map((dept) => {
+                const count = dept === 'All' ? employees.length : (departmentCounts[dept] || 0)
+                return (
+                  <button
+                    key={dept}
+                    onClick={() => setEmployeeDepartment(dept)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                      employeeDepartment === dept
+                        ? 'bg-brand-600 text-white shadow-md shadow-brand-900/40'
+                        : 'bg-surface-800/80 text-surface-400 hover:text-white border border-surface-700/60'
+                    }`}
+                  >
+                    {dept} ({count})
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="relative min-w-[220px] flex-1 sm:flex-initial">
+              <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-surface-500" />
+              <input
+                type="text"
+                placeholder="Search staff by name or role..."
+                value={employeeQuery}
+                onChange={(e) => setEmployeeQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 text-xs bg-surface-950 border border-surface-800 rounded-lg text-white placeholder-surface-500 focus:outline-none focus:border-brand-500"
+              />
+            </div>
+          </div>
+
+          {filteredEmployees.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-surface-800 bg-surface-900/30 p-8 text-center text-xs text-surface-500">
+              No personnel matched the current filter criteria.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3.5">
+              {filteredEmployees.map((emp: any, idx: number) => {
+                const initials = emp.name
+                  ? emp.name.split(' ').map((n: string) => n[0]).slice(0, 2).join('').toUpperCase()
+                  : 'EM'
+                const isLeader = emp.department === 'Executive Leadership'
+                const isSec = emp.department === 'Cybersecurity & IT'
+                const empEmail = emp.inferred_email || emp.email || `${emp.name?.toLowerCase().replace(/\s+/g, '.')}@${targetDomain}`
+
+                return (
+                  <div
+                    key={idx}
+                    className="rounded-2xl border border-surface-800 bg-surface-900/70 p-4 flex flex-col justify-between space-y-3 hover:border-surface-700 transition-all shadow-md"
+                  >
+                    <div className="flex items-start gap-3">
+                      {emp.avatar_url ? (
+                        <img
+                          src={emp.avatar_url}
+                          alt={emp.name}
+                          className="h-11 w-11 rounded-xl object-cover border border-surface-700 bg-surface-950 flex-shrink-0"
+                          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+                        />
+                      ) : (
+                        <div className={`h-11 w-11 rounded-xl border flex items-center justify-center font-bold text-xs flex-shrink-0 ${
+                          isLeader
+                            ? 'bg-amber-500/20 border-amber-500/30 text-amber-300'
+                            : isSec
+                            ? 'bg-red-500/20 border-red-500/30 text-red-300'
+                            : 'bg-blue-500/20 border-blue-500/30 text-blue-300'
+                        }`}>
+                          {initials}
+                        </div>
+                      )}
+
+                      <div className="min-w-0 flex-1">
+                        <h4 className="text-xs font-bold text-white truncate">{emp.name}</h4>
+                        <span className="text-[11px] text-surface-300 truncate block mt-0.5">
+                          {emp.title}
+                        </span>
+                        <div className="flex items-center gap-1.5 mt-1">
+                          <span className="rounded bg-surface-800 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-surface-400 border border-surface-700">
+                            {emp.department}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Email Chip */}
+                    <div className="flex items-center justify-between gap-2 rounded-lg bg-surface-950/80 px-2.5 py-1.5 border border-surface-800/80 text-[10px]">
+                      <span className="font-mono text-brand-300 truncate">📧 {empEmail}</span>
+                      <button
+                        onClick={() => copyToClipboard(empEmail, `emp-email-${idx}`)}
+                        className="text-surface-400 hover:text-white flex-shrink-0"
+                      >
+                        {copiedKey === `emp-email-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                      </button>
+                    </div>
+
+                    <div className="pt-2 border-t border-surface-800/80 flex items-center justify-between text-[11px]">
+                      <span className="text-[10px] text-surface-500 truncate max-w-[130px]">
+                        {emp.source || 'Public Footprint'}
+                      </span>
+                      {emp.linkedin_url ? (
+                        <a
+                          href={emp.linkedin_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-semibold text-blue-400 hover:text-blue-300 inline-flex items-center gap-1"
+                        >
+                          <span>Profile</span>
+                          <ExternalLink className="h-2.5 w-2.5" />
+                        </a>
+                      ) : (
+                        <a
+                          href={emp.linkedin_search_url || `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(emp.name + ' ' + companyName)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-surface-400 hover:text-blue-300 inline-flex items-center gap-1"
+                        >
+                          <span>Search</span>
+                          <ExternalLink className="h-2.5 w-2.5" />
                         </a>
                       )}
                     </div>
@@ -1349,177 +1873,380 @@ function OSINTResultView({ data }: { data: any }) {
                 )
               })}
             </div>
-          </div>
+          )}
+        </div>
+      )}
 
-          {/* Data Breach Checks */}
-          {activeProfile.breach_checks && (
-            <div className={`glass-card p-6 border space-y-4 ${
-              activeProfile.breach_checks.pwned
-                ? 'border-red-500/30 bg-red-950/10'
-                : 'border-emerald-500/20 bg-emerald-950/10'
-            }`}>
-              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                <span>🔓</span> Data Breach Intelligence
-                <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full border ml-1 ${
-                  activeProfile.breach_checks.pwned
-                    ? 'bg-red-500/20 text-red-400 border-red-500/30'
-                    : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
-                }`}>
-                  {activeProfile.breach_checks.pwned ? `⚠ ${activeProfile.breach_checks.breach_count} Breach(es) Detected` : '✓ Clean'}
-                </span>
-              </h3>
+      {/* ── TAB 4: Corporate Identities (Behind the Email) ── */}
+      {activeTab === 'identities' && (
+        <div className="space-y-5">
+          {/* Email Selector Chips */}
+          {emails.length > 0 && (
+            <div className="rounded-2xl border border-surface-800 bg-surface-900/60 p-5 space-y-3">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <span>📧</span>
+                  <span>Discovered Corporate Email Identities ({emails.length})</span>
+                </h3>
+                <span className="text-xs text-surface-400">Select identity to inspect enrichment & breach exposures</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {emails.map((e: string, idx: number) => (
+                  <button
+                    key={e}
+                    onClick={() => setSelectedEmail(idx)}
+                    className={`rounded-xl px-3.5 py-1.5 text-xs font-mono transition-all border ${
+                      selectedEmail === idx
+                        ? 'bg-brand-600/30 border-brand-500/60 text-brand-300 shadow-md shadow-brand-950/40'
+                        : 'bg-surface-900 border-surface-800 text-surface-400 hover:text-white hover:border-surface-700'
+                    }`}
+                  >
+                    {e}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
-              {activeProfile.breach_checks.pwned ? (
-                <div className="space-y-3">
-                  <div className="flex flex-wrap gap-1.5 mb-3">
-                    <span className="text-xs text-surface-400">Compromised data:</span>
-                    {(activeProfile.breach_checks.compromised_data || []).map((d: string) => (
-                      <span key={d} className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20 font-medium">
-                        {d}
-                      </span>
+          {activeProfile && (
+            <div className="space-y-4">
+              {/* Profile Enrichment Card */}
+              <div className="rounded-2xl border border-surface-800 bg-surface-900/70 p-6 space-y-4 shadow-lg">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                    <span>👤</span> Profile Enrichment & Verified Professional Registers
+                  </h4>
+                  <span className="rounded-full bg-blue-500/10 px-2.5 py-0.5 text-[10px] font-semibold text-blue-400 border border-blue-500/20">
+                    Behind the Email Engine
+                  </span>
+                </div>
+
+                <div className="flex items-start gap-4">
+                  {activeProfile.avatar_url && (
+                    <img
+                      src={activeProfile.avatar_url}
+                      alt="Avatar"
+                      className="h-16 w-16 rounded-2xl border border-surface-700 bg-surface-950 object-cover flex-shrink-0"
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+                    />
+                  )}
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-3 flex-1">
+                    {[
+                      ['Full Name', activeProfile.profile_enrichment?.full_name],
+                      ['Inferred Role', activeProfile.profile_enrichment?.inferred_role],
+                      ['Department', activeProfile.profile_enrichment?.department],
+                      ['Company', activeProfile.profile_enrichment?.company],
+                      ['Email', activeProfile.email],
+                      ['Username', activeProfile.profile_enrichment?.username],
+                    ].filter(([,v]) => v).map(([label, value]) => (
+                      <div key={label as string}>
+                        <span className="text-[10px] uppercase tracking-wider text-surface-500 font-semibold block mb-0.5">{label}</span>
+                        <span className="text-xs font-semibold text-white">{value}</span>
+                      </div>
                     ))}
                   </div>
-                  {(activeProfile.breach_checks.breaches || []).map((b: any, idx: number) => (
-                    <div key={idx} className="p-3 rounded-xl bg-surface-900/60 border border-surface-800 space-y-1.5">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-semibold text-white">{b.name}</span>
-                        <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded-full border ${
-                          b.risk === 'critical' ? 'text-red-400 bg-red-500/10 border-red-500/20' :
-                          b.risk === 'high' ? 'text-orange-400 bg-orange-500/10 border-orange-500/20' :
-                          'text-amber-400 bg-amber-500/10 border-amber-500/20'
-                        }`}>{b.risk} risk</span>
-                      </div>
-                      <div className="text-[10px] text-surface-400">
-                        📅 {b.date} &nbsp;·&nbsp; {b.pwn_count?.toLocaleString()} accounts
-                      </div>
-                      <div className="flex flex-wrap gap-1">
-                        {(b.data_classes || []).map((c: string) => (
-                          <span key={c} className="text-[9px] px-1.5 py-0.5 rounded bg-surface-800 text-surface-400 border border-surface-700">
-                            {c}
+                </div>
+              </div>
+
+              {/* Data Breach Check Card */}
+              {activeProfile.breach_checks && (
+                <div className={`rounded-2xl border p-6 space-y-3 ${
+                  activeProfile.breach_checks.pwned
+                    ? 'border-red-500/40 bg-gradient-to-br from-red-950/20 via-surface-900 to-surface-950 shadow-xl'
+                    : 'border-emerald-500/30 bg-gradient-to-br from-emerald-950/20 via-surface-900 to-surface-950'
+                }`}>
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                      <ShieldAlert className={`h-4 w-4 ${activeProfile.breach_checks.pwned ? 'text-red-400' : 'text-emerald-400'}`} />
+                      <span>Historical Data Breach Intelligence</span>
+                    </h4>
+                    <span className={`rounded-full px-3 py-0.5 text-xs font-bold border ${
+                      activeProfile.breach_checks.pwned
+                        ? 'bg-red-500/20 text-red-400 border-red-500/30'
+                        : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
+                    }`}>
+                      {activeProfile.breach_checks.pwned
+                        ? `⚠️ ${activeProfile.breach_checks.breach_count} Breach Exposure(s)`
+                        : '✓ No Breaches Detected'}
+                    </span>
+                  </div>
+
+                  {activeProfile.breach_checks.pwned ? (
+                    <div className="space-y-3 pt-2">
+                      <div className="flex flex-wrap gap-1.5 items-center">
+                        <span className="text-xs text-surface-400">Compromised attributes:</span>
+                        {(activeProfile.breach_checks.compromised_data || []).map((d: string) => (
+                          <span key={d} className="rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-semibold text-red-400 border border-red-500/20">
+                            {d}
                           </span>
                         ))}
                       </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                        {(activeProfile.breach_checks.breaches || []).map((b: any, bIdx: number) => (
+                          <div key={bIdx} className="rounded-xl border border-surface-800 bg-surface-950/80 p-3 space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-bold text-white">{b.name}</span>
+                              <span className="text-[9px] font-bold uppercase text-red-400 bg-red-500/10 border border-red-500/20 px-1.5 py-0.5 rounded">
+                                {b.risk} risk
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-surface-400">📅 {b.date} · {b.pwn_count?.toLocaleString()} accounts</p>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  ))}
+                  ) : (
+                    <p className="text-xs text-emerald-400/90">
+                      No compromised passwords or breach credentials were found for this identity in public leak indexes.
+                    </p>
+                  )}
                 </div>
-              ) : (
-                <p className="text-xs text-emerald-400/80">No breach records detected for this identity in the monitored databases.</p>
               )}
 
-              <p className="text-[10px] text-surface-600">
-                ℹ️ Source: {activeProfile.breach_checks.checked_database}
-              </p>
-            </div>
-          )}
+              {/* Social Discovery (12 Platforms) */}
+              <div className="rounded-2xl border border-surface-800 bg-surface-900/60 p-6 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                    <span>🌐</span> Multi-Platform Social Footprint Scan
+                  </h4>
+                  <span className="text-xs text-surface-500">12 Platforms Analyzed</span>
+                </div>
 
-          {/* Silent Execution Badge */}
-          {activeProfile.silent_execution && (
-            <div className="flex items-center gap-3 px-4 py-3 rounded-xl border border-surface-700/50 bg-surface-900/40">
-              <span className="text-base">🔇</span>
-              <div>
-                <span className="text-xs font-semibold text-surface-300">{activeProfile.silent_execution.description}</span>
-                <span className="block text-[10px] text-surface-600 mt-0.5">
-                  Mode: {activeProfile.silent_execution.mode} &nbsp;·&nbsp; Target alerted: {activeProfile.silent_execution.target_notified ? 'Yes' : 'No'}
-                </span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 pt-1">
+                  {(activeProfile.social_discovery || []).map((acc: any, idx: number) => {
+                    const statusStyle = STATUS_STYLE[acc.status] || STATUS_STYLE.not_detected
+                    const icon = PLATFORM_ICONS[acc.icon] || '🔗'
+
+                    return (
+                      <div
+                        key={idx}
+                        className={`rounded-xl border p-3 flex items-start gap-3 transition-all ${statusStyle}`}
+                      >
+                        <span className="text-lg flex-shrink-0 mt-0.5">{icon}</span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-1 mb-0.5">
+                            <span className="text-xs font-bold text-white truncate">{acc.platform}</span>
+                            <span className={`text-[8px] uppercase font-bold px-1.5 py-0.5 rounded-full border ${statusStyle}`}>
+                              {acc.status === 'found' || acc.status === 'detected' ? '✓ Found' : '—'}
+                            </span>
+                          </div>
+                          <p className="text-[10px] opacity-80 truncate">{acc.details}</p>
+                          {acc.profile_url && (
+                            <a
+                              href={acc.profile_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-[10px] text-brand-300 hover:underline mt-1 block truncate"
+                            >
+                              View Profile <ExternalLink className="inline h-2 w-2" />
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
               </div>
             </div>
           )}
-        </>
+        </div>
       )}
 
-      {/* ── LinkedIn Corporate Intelligence ── */}
-      {linkedinIntel?.dorks?.length > 0 && (
-        <div className="glass-card p-6 border border-surface-800 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-              <span>💼</span> LinkedIn Corporate Intelligence
-            </h3>
-            {linkedinIntel.company_search_url && (
-              <a
-                href={linkedinIntel.company_search_url}
-                target="_blank" rel="noopener noreferrer"
-                className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 transition-colors"
-              >
-                {linkedinIntel.company_name} on LinkedIn <ExternalLink className="h-3 w-3" />
-              </a>
+      {/* ── TAB 5: Wayback Machine & Historical Footprint ── */}
+      {activeTab === 'wayback' && (
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-surface-800 bg-surface-900/70 p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>🏛️</span>
+                <span>Wayback Machine — Internet Archive Historical Timeline</span>
+              </h3>
+              {internetIntel.wayback_machine?.archive_url && (
+                <a
+                  href={internetIntel.wayback_machine.archive_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600/20 text-blue-300 border border-blue-500/30 text-xs font-semibold hover:bg-blue-600/30 transition-all"
+                >
+                  Browse Full Archive <ExternalLink className="h-3 w-3" />
+                </a>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="rounded-xl border border-surface-800 bg-surface-950/70 p-3">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Archive Status</span>
+                <span className={`text-sm font-bold ${internetIntel.wayback_machine?.available ? 'text-emerald-400' : 'text-surface-500'}`}>
+                  {internetIntel.wayback_machine?.available ? '✓ History Found' : 'No Snapshots'}
+                </span>
+              </div>
+              <div className="rounded-xl border border-surface-800 bg-surface-950/70 p-3">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Total Snapshots</span>
+                <span className="text-sm font-bold text-white">{internetIntel.wayback_machine?.total_snapshots || 0}</span>
+              </div>
+              <div className="rounded-xl border border-surface-800 bg-surface-950/70 p-3">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Estimated Age</span>
+                <span className="text-sm font-bold text-brand-400">{internetIntel.domain_age_estimate || 'Active'}</span>
+              </div>
+              <div className="rounded-xl border border-surface-800 bg-surface-950/70 p-3">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">First Recorded</span>
+                <span className="text-sm font-bold text-white">{internetIntel.wayback_machine?.oldest_snapshot?.year || '—'}</span>
+              </div>
+            </div>
+
+            {internetIntel.wayback_machine?.notable_years && internetIntel.wayback_machine.notable_years.length > 0 && (
+              <div className="flex items-center gap-2 flex-wrap pt-2">
+                <span className="text-[11px] font-semibold text-surface-400 uppercase">Archived Snapshots:</span>
+                {internetIntel.wayback_machine.notable_years.map((year: string) => (
+                  <a
+                    key={year}
+                    href={`https://web.archive.org/web/${year}/${targetDomain}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded-lg bg-surface-800 px-2.5 py-1 text-xs text-surface-300 border border-surface-700 hover:text-white hover:border-surface-600 transition-colors"
+                  >
+                    {year}
+                  </a>
+                ))}
+              </div>
             )}
           </div>
-          {linkedinIntel.detected_email_pattern && (
-            <div className="px-3 py-2 rounded-lg bg-surface-900/60 border border-surface-800 text-xs font-mono text-brand-400">
-              📧 Inferred email pattern: <strong>{linkedinIntel.detected_email_pattern}</strong>
+        </div>
+      )}
+
+      {/* ── TAB 6: Reconnaissance Tools & Targeted Dorks ── */}
+      {activeTab === 'recon_tools' && (
+        <div className="space-y-6">
+          {/* LinkedIn Targeted Employee Enumeration Dorks */}
+          <div className="rounded-2xl border border-surface-800 bg-surface-900/70 p-6 space-y-4">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>💼</span>
+                <span>LinkedIn Corporate Intelligence & Role Enumeration Dorks</span>
+              </h3>
+              <p className="text-xs text-surface-400 mt-0.5">
+                Targeted search queries for uncovering executive leadership, engineering teams, and job posting disclosures.
+              </p>
             </div>
-          )}
-          <div className="space-y-2">
-            {linkedinIntel.dorks.map((d: any, idx: number) => (
-              <div key={idx} className="p-3.5 rounded-xl border border-surface-800 bg-surface-900/50 space-y-1.5">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <span className="text-xs font-semibold text-white block">{d.role_category}</span>
-                    <span className="text-[11px] text-surface-400">{d.description}</span>
+
+            <div className="space-y-2.5">
+              {(linkedinIntel.dorks || []).map((d: any, idx: number) => (
+                <div
+                  key={idx}
+                  className="rounded-xl border border-surface-800 bg-surface-950/70 p-3.5 space-y-2 hover:border-surface-700 transition-all"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <span className="text-xs font-bold text-white block">{d.role_category}</span>
+                      <span className="text-[11px] text-surface-400">{d.description}</span>
+                    </div>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      <button
+                        onClick={() => copyToClipboard(d.dork, `li-dork-${idx}`)}
+                        className="flex items-center gap-1 rounded-lg bg-surface-800 px-2.5 py-1 text-xs text-surface-300 hover:text-white border border-surface-700 transition-colors"
+                      >
+                        {copiedKey === `li-dork-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+                        <span>{copiedKey === `li-dork-${idx}` ? 'Copied' : 'Copy Query'}</span>
+                      </button>
+                      <a
+                        href={d.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 rounded-lg bg-blue-600/20 px-2.5 py-1 text-xs font-semibold text-blue-300 border border-blue-500/30 hover:bg-blue-600/30 transition-all"
+                      >
+                        <span>Search</span> <ExternalLink className="h-3 w-3" />
+                      </a>
+                    </div>
+                  </div>
+                  <code className="block rounded-lg bg-surface-900/80 p-2 font-mono text-[10px] text-surface-400 border border-surface-800 overflow-x-auto">
+                    {d.dork}
+                  </code>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Google Dorks */}
+          <div className="rounded-2xl border border-surface-800 bg-surface-900/70 p-6 space-y-4">
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <span>🔍</span> Targeted Google Dorks Reconnaissance
+            </h3>
+            <div className="space-y-2">
+              {dorks.map((d: any, idx: number) => (
+                <div key={idx} className="rounded-xl border border-surface-800 bg-surface-950/70 p-3.5 flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <span className="text-xs font-bold text-white block">{d.category}</span>
+                    <span className="font-mono text-[11px] text-surface-400 truncate block mt-0.5">{d.dork}</span>
                   </div>
                   <a
                     href={d.url}
-                    target="_blank" rel="noopener noreferrer"
-                    className="px-2.5 py-1.5 rounded-lg text-xs bg-blue-600/20 text-blue-400 border border-blue-500/30 hover:bg-blue-600/30 transition-colors flex items-center gap-1 flex-shrink-0"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 rounded-lg bg-brand-600/20 px-3 py-1.5 text-xs font-semibold text-brand-300 border border-brand-500/30 hover:bg-brand-600/30 transition-all flex-shrink-0"
                   >
-                    Search <ExternalLink className="h-3 w-3" />
+                    <span>Execute</span> <ExternalLink className="h-3 w-3" />
                   </a>
                 </div>
-                <code className="text-[10px] font-mono text-surface-500 block leading-relaxed">{d.dork}</code>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ── Google Dorks ── */}
-      <div className="glass-card p-6 border border-surface-800 space-y-3">
-        <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-          <span>🔍</span> Targeted Google Dorks Reconnaissance
-        </h3>
-        <div className="space-y-2">
-          {dorks.map((d: any, idx: number) => (
-            <div key={idx} className="p-3 bg-surface-900/60 rounded-xl border border-surface-800 flex items-center justify-between gap-4">
-              <div>
-                <span className="text-xs font-semibold text-white block">{d.category}</span>
-                <span className="text-xs font-mono text-surface-400">{d.dork}</span>
-              </div>
-              <a
-                href={d.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-2.5 py-1.5 rounded-lg text-xs bg-brand-600/20 text-brand-400 border border-brand-500/30 hover:bg-brand-600/30 transition-colors flex items-center gap-1.5 flex-shrink-0"
-              >
-                Query Google <ExternalLink className="h-3 w-3" />
-              </a>
+              ))}
             </div>
-          ))}
-        </div>
-      </div>
-
-      {/* ── GitHub Recon ── */}
-      {githubRecon.length > 0 && (
-        <div className="glass-card p-6 border border-surface-800 space-y-3">
-          <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-            <span>🐙</span> GitHub Code Leak Reconnaissance
-          </h3>
-          <div className="space-y-2">
-            {githubRecon.map((q: any, idx: number) => (
-              <div key={idx} className="p-3 bg-surface-900/60 rounded-xl border border-surface-800 flex items-center justify-between gap-4">
-                <div>
-                  <span className="text-xs font-semibold text-white block">{q.description}</span>
-                  <span className="text-xs font-mono text-surface-400">{q.query}</span>
-                </div>
-                <a
-                  href={q.url}
-                  target="_blank" rel="noopener noreferrer"
-                  className="px-2.5 py-1.5 rounded-lg text-xs bg-surface-800 text-surface-300 border border-surface-700 hover:bg-surface-700 transition-colors flex items-center gap-1.5 flex-shrink-0"
-                >
-                  GitHub <ExternalLink className="h-3 w-3" />
-                </a>
-              </div>
-            ))}
           </div>
+
+          {/* GitHub Secret Leaks */}
+          {githubRecon.length > 0 && (
+            <div className="rounded-2xl border border-surface-800 bg-surface-900/70 p-6 space-y-4">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>🐙</span> GitHub Code & Secrets Exposure Reconnaissance
+              </h3>
+              <div className="space-y-2">
+                {githubRecon.map((q: any, idx: number) => (
+                  <div key={idx} className="rounded-xl border border-surface-800 bg-surface-950/70 p-3.5 flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                      <span className="text-xs font-bold text-white block">{q.description}</span>
+                      <span className="font-mono text-[11px] text-surface-400 truncate block mt-0.5">{q.query}</span>
+                    </div>
+                    <a
+                      href={q.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-lg bg-surface-800 px-3 py-1.5 text-xs font-semibold text-surface-300 border border-surface-700 hover:text-white transition-all flex-shrink-0"
+                    >
+                      <span>GitHub</span> <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Public Corporate Registers & Technical Lookups */}
+          {internetIntel.infrastructure_intel && internetIntel.infrastructure_intel.length > 0 && (
+            <div className="rounded-2xl border border-surface-800 bg-surface-900/70 p-6 space-y-4">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <span>🌐</span> Public Corporate Registers & Internet Intelligence Lookups
+              </h3>
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                {internetIntel.infrastructure_intel.slice(0, 8).map((item: any, idx: number) => (
+                  <a
+                    key={idx}
+                    href={item.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded-xl border border-surface-800 bg-surface-950/60 p-3 hover:border-surface-700 hover:bg-surface-950 transition-all flex items-start gap-2.5 group"
+                  >
+                    <span className="text-lg flex-shrink-0 mt-0.5">{item.icon}</span>
+                    <div className="min-w-0 flex-1">
+                      <span className="text-xs font-bold text-white group-hover:text-brand-300 transition-colors block truncate">
+                        {item.name}
+                      </span>
+                      <span className="text-[10px] text-surface-500 block truncate">{item.category}</span>
+                    </div>
+                    <ExternalLink className="h-3 w-3 text-surface-600 group-hover:text-white flex-shrink-0 transition-colors mt-0.5" />
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

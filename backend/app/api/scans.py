@@ -65,17 +65,8 @@ async def create_scan(
     domain = body.domain
     profile = body.profile
 
-    # Try Celery first, fall back to in-process concurrent runner
-    dispatched = False
-    try:
-        from app.tasks.scan_tasks import dispatch_scan
-        dispatch_scan.delay(scan_id, domain, profile)
-        dispatched = True
-    except Exception:
-        pass
-
-    if not dispatched:
-        asyncio.create_task(_run_scan_concurrent(scan_id, domain, profile))
+    # Dispatch in-process concurrent runner immediately
+    asyncio.create_task(_run_scan_concurrent(scan_id, domain, profile))
 
     return scan
 
@@ -292,9 +283,10 @@ async def _run_scan_concurrent(scan_id: str, target: str, profile: str) -> None:
 
             # Execute with timeout
             try:
+                mod_timeout = getattr(instance, "timeout", 120)
                 result = await asyncio.wait_for(
                     instance.execute(target),
-                    timeout=getattr(instance, "timeout", 60) + 15,
+                    timeout=max(mod_timeout + 30, 150),
                 )
             except asyncio.TimeoutError:
                 async with async_session_factory() as session:

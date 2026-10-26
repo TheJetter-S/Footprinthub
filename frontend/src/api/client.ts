@@ -54,8 +54,22 @@ async function request<T>(endpoint: string, options: RequestOptions = {}): Promi
   }
 
   if (!response.ok) {
-    const errorBody = await response.json().catch(() => ({ detail: response.statusText }))
-    throw new ApiError(response.status, errorBody.detail || response.statusText)
+    let errorDetail = response.statusText
+    try {
+      const errorBody = await response.json()
+      if (typeof errorBody?.detail === 'string') {
+        errorDetail = errorBody.detail
+      } else if (Array.isArray(errorBody?.detail)) {
+        errorDetail = errorBody.detail.map((e: { msg?: string }) => e.msg || '').filter(Boolean).join(', ') || response.statusText
+      } else if (errorBody?.message) {
+        errorDetail = errorBody.message
+      }
+    } catch {
+      if (response.status >= 500) {
+        errorDetail = 'Backend server is unreachable. Please ensure the FastAPI backend is running on port 8000.'
+      }
+    }
+    throw new ApiError(response.status, errorDetail)
   }
 
   // Handle 204 No Content
