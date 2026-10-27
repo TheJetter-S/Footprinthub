@@ -538,7 +538,7 @@ class OSINTModule(BaseModule):
     name: str = "osint"
     description: str = "Corporate email discovery, Behind the Email identity lookup, LinkedIn profiling, breach checks, and Google Dorks"
     mode: ModuleMode = ModuleMode.PASSIVE
-    timeout: int = 60
+    timeout: int = 150
 
     async def run(
         self,
@@ -560,34 +560,30 @@ class OSINTModule(BaseModule):
         # Scrape multiple public paths for corporate emails, team info, and social profiles
         paths_to_crawl = [
             "",
-            "/about",
             "/about-us",
-            "/team",
-            "/leadership",
-            "/people",
-            "/company",
+            "/about",
             "/contact",
             "/contact-us",
-            "/our-team",
-            "/founders",
-            "/.well-known/security.txt",
+            "/team",
         ]
 
-        # Use a persistent client with realistic browser headers and generous timeout for CDNs / slow hosts
+        # Use a persistent client with realistic browser headers and safe timeouts
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        client = httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False, headers=headers)
+        client = httpx.AsyncClient(timeout=8.0, follow_redirects=True, verify=False, headers=headers)
         try:
             # 1. Fetch homepage first to discover internal links dynamically (e.g. /about-us, /our-team)
             homepage_html = ""
+            active_host = clean_target
             for probe_host in [clean_target, base_domain]:
                 try:
-                    resp = await client.get(f"https://{probe_host}/")
+                    resp = await client.get(f"https://{probe_host}/", timeout=6.0)
                     if resp.status_code == 200 and resp.text:
                         homepage_html = resp.text
+                        active_host = probe_host
                         all_crawled_html += homepage_html + "\n"
                         break
                 except Exception:
@@ -595,9 +591,10 @@ class OSINTModule(BaseModule):
             if not homepage_html:
                 for probe_host in [clean_target, base_domain]:
                     try:
-                        resp = await client.get(f"http://{probe_host}/")
+                        resp = await client.get(f"http://{probe_host}/", timeout=6.0)
                         if resp.status_code == 200 and resp.text:
                             homepage_html = resp.text
+                            active_host = probe_host
                             all_crawled_html += homepage_html + "\n"
                             break
                     except Exception:
@@ -624,23 +621,21 @@ class OSINTModule(BaseModule):
                             except Exception:
                                 pass
 
-            # Crawl remaining paths concurrently in batches of 4
-            remaining_paths = [p for p in paths_to_crawl if p != ""]
+            # Filter unique non-empty paths and limit to top 6 to guarantee speed
+            remaining_paths = [p for p in dict.fromkeys(paths_to_crawl) if p != ""][:6]
+
             async def _crawl_path(path: str) -> str:
-                for host in [clean_target, base_domain]:
-                    try:
-                        url = f"https://{host}{path}"
-                        resp = await client.get(url)
-                        if resp.status_code == 200 and resp.text:
-                            return resp.text
-                    except Exception:
-                        pass
+                try:
+                    url = f"https://{active_host}{path}"
+                    resp = await client.get(url, timeout=5.0)
+                    if resp.status_code == 200 and resp.text:
+                        return resp.text
+                except Exception:
+                    pass
                 return ""
 
-            batch_size = 4
-            for i in range(0, len(remaining_paths), batch_size):
-                batch = remaining_paths[i:i + batch_size]
-                results_batch = await asyncio.gather(*[_crawl_path(p) for p in batch])
+            if remaining_paths:
+                results_batch = await asyncio.gather(*[_crawl_path(p) for p in remaining_paths])
                 for h_text in results_batch:
                     if h_text:
                         all_crawled_html += h_text + "\n"
@@ -765,10 +760,16 @@ class OSINTModule(BaseModule):
                 for em in list(emails_found)[:6]
             ]
             if enrichment_tasks:
-                results = await asyncio.gather(*enrichment_tasks, return_exceptions=True)
-                for res in results:
-                    if isinstance(res, dict):
-                        behind_the_email_profiles.append(res)
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*enrichment_tasks, return_exceptions=True),
+                        timeout=12.0,
+                    )
+                    for res in results:
+                        if isinstance(res, dict):
+                            behind_the_email_profiles.append(res)
+                except Exception:
+                    pass
 
             # Check if any emails have critical breach exposures
             breached_count = 0
@@ -825,8 +826,11 @@ class OSINTModule(BaseModule):
             # ── Wayback Machine & Internet-Wide Intelligence ────────────────────
             self._progress(on_progress, 84, "Querying Wayback Machine and aggregating internet-wide intelligence...")
             try:
-                wayback_data = await WebsiteIntelligenceEngine.gather_wayback_intelligence(
-                    domain=base_domain, client=client
+                wayback_data = await asyncio.wait_for(
+                    WebsiteIntelligenceEngine.gather_wayback_intelligence(
+                        domain=base_domain, client=client
+                    ),
+                    timeout=8.0,
                 )
             except Exception:
                 wayback_data = {"available": False, "total_snapshots": 0}

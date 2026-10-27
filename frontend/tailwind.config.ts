@@ -13,6 +13,19 @@ export default {
         ring: 'hsl(var(--ring))',
         background: 'hsl(var(--background))',
         foreground: 'hsl(var(--foreground))',
+        // Customizing exact shades to match the high-end dev tool vibe
+        zinc: {
+          950: '#09090b',
+          900: '#18181b',
+          800: '#27272a',
+          400: '#a1a1aa',
+          50: '#fafafa',
+        },
+        indigo: {
+          400: '#818cf8',
+          500: '#6366f1',
+          600: '#4f46e5',
+        },
         // Custom color palette — cybersecurity-inspired dark theme
         brand: {
           50: '#eef9ff',

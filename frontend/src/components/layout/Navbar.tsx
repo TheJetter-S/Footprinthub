@@ -1,169 +1,174 @@
 // =============================================================================
-// FootprintHub — Navbar Component
+// FootprintHub — Navbar Component (Matches User Design)
 // =============================================================================
 
-import { Link, useLocation } from 'react-router-dom'
-import {
-  Shield,
-  History,
-  LogOut,
-  Sun,
-  Moon,
-  Menu,
-  X,
-} from 'lucide-react'
 import { useState } from 'react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Menu, X, LogOut } from 'lucide-react'
 
 interface NavbarProps {
   isAuthenticated: boolean
-  darkMode: boolean
-  onToggleTheme: () => void
+  darkMode?: boolean
+  onToggleTheme?: () => void
   onLogout: () => void
 }
 
 export default function Navbar({
   isAuthenticated,
-  darkMode,
-  onToggleTheme,
   onLogout,
 }: NavbarProps) {
   const location = useLocation()
+  const navigate = useNavigate()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
   const isActive = (path: string) => location.pathname === path
 
   return (
-    <nav className="sticky top-0 z-50 glass-card border-b border-surface-800/50 backdrop-blur-xl">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16">
-          {/* Logo */}
-          <Link to="/" className="flex items-center gap-2.5 group">
-            <div className="relative">
-              <Shield className="h-8 w-8 text-brand-500 group-hover:text-brand-400 transition-colors" />
-              <div className="absolute inset-0 bg-brand-500/20 rounded-full blur-lg group-hover:bg-brand-400/30 transition-all" />
-            </div>
-            <span className="text-xl font-bold gradient-text">
-              FootprintHub
-            </span>
-          </Link>
+    <header className="border-b border-zinc-800/60 bg-zinc-950/80 backdrop-blur-md sticky top-0 z-50">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        {/* Logo */}
+        <Link to="/" className="flex items-center gap-2 cursor-pointer group">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className="text-indigo-500 group-hover:text-indigo-400 transition-colors"
+          >
+            <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
+            <path d="M5 3v4" />
+            <path d="M19 17v4" />
+            <path d="M3 5h4" />
+            <path d="M17 19h4" />
+          </svg>
+          <span className="text-zinc-50 font-semibold tracking-tight text-lg">
+            FootprintHub
+          </span>
+        </Link>
 
-          {/* Desktop Navigation */}
-          <div className="hidden md:flex items-center gap-1">
-            {isAuthenticated && (
-              <>
-                <Link
-                  to="/"
-                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 ${
-                    isActive('/')
-                      ? 'bg-brand-500/15 text-brand-400'
-                      : 'text-surface-400 hover:text-surface-100 hover:bg-surface-800/50'
-                  }`}
-                >
-                  New Scan
-                </Link>
-                <Link
-                  to="/history"
-                  className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1.5 ${
-                    isActive('/history')
-                      ? 'bg-brand-500/15 text-brand-400'
-                      : 'text-surface-400 hover:text-surface-100 hover:bg-surface-800/50'
-                  }`}
-                >
-                  <History className="h-4 w-4" />
-                  History
-                </Link>
-              </>
-            )}
-
-            <div className="w-px h-6 bg-surface-800 mx-2" />
-
-            {/* Theme Toggle */}
-            <button
-              onClick={onToggleTheme}
-              className="p-2 rounded-lg text-surface-400 hover:text-surface-100 hover:bg-surface-800/50 transition-all"
-              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+        {/* Desktop Navigation */}
+        <div className="flex items-center gap-6">
+          <nav className="hidden md:flex gap-6 text-sm font-medium">
+            <Link
+              to="/"
+              className={`transition-colors ${
+                isActive('/') ? 'text-zinc-50 font-semibold' : 'text-zinc-400 hover:text-zinc-50'
+              }`}
             >
-              {darkMode ? (
-                <Sun className="h-5 w-5" />
-              ) : (
-                <Moon className="h-5 w-5" />
-              )}
+              Scans
+            </Link>
+            <Link
+              to="/history"
+              className={`transition-colors ${
+                isActive('/history') ? 'text-zinc-50 font-semibold' : 'text-zinc-400 hover:text-zinc-50'
+              }`}
+            >
+              History
+            </Link>
+            <Link
+              to="/history"
+              className={`transition-colors ${
+                location.pathname.startsWith('/scan/') ? 'text-zinc-50 font-semibold' : 'text-zinc-400 hover:text-zinc-50'
+              }`}
+            >
+              Reports
+            </Link>
+            <Link
+              to="/terms"
+              className={`transition-colors ${
+                isActive('/terms') ? 'text-zinc-50 font-semibold' : 'text-zinc-400 hover:text-zinc-50'
+              }`}
+            >
+              Docs
+            </Link>
+          </nav>
+
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => navigate('/')}
+              className="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium py-2 px-4 rounded-md transition-all shadow-sm shadow-indigo-900/20 active:scale-95"
+            >
+              New scan
             </button>
 
-            {/* Auth Actions */}
             {isAuthenticated ? (
               <button
                 onClick={onLogout}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium text-surface-400 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                title="Sign out"
+                className="hidden md:flex items-center gap-1.5 text-xs text-zinc-500 hover:text-red-400 py-1.5 px-2.5 rounded hover:bg-zinc-900 transition-colors"
               >
-                <LogOut className="h-4 w-4" />
-                Logout
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Logout</span>
               </button>
             ) : (
               <Link
                 to="/login"
-                className="px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 text-white hover:bg-brand-500 transition-all"
+                className="text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
               >
                 Sign In
               </Link>
             )}
-          </div>
 
-          {/* Mobile menu button */}
-          <button
-            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-            className="md:hidden p-2 rounded-lg text-surface-400 hover:text-surface-100"
-          >
-            {mobileMenuOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
-          </button>
-        </div>
-
-        {/* Mobile Menu */}
-        {mobileMenuOpen && (
-          <div className="md:hidden py-4 space-y-2 animate-slide-up">
-            {isAuthenticated && (
-              <>
-                <Link
-                  to="/"
-                  onClick={() => setMobileMenuOpen(false)}
-                  className="block px-4 py-2 rounded-lg text-sm font-medium text-surface-300 hover:bg-surface-800/50"
-                >
-                  New Scan
-                </Link>
-                <Link
-                  to="/history"
-                  onClick={() => setMobileMenuOpen(false)}
-                  className="block px-4 py-2 rounded-lg text-sm font-medium text-surface-300 hover:bg-surface-800/50"
-                >
-                  History
-                </Link>
-              </>
-            )}
+            {/* Mobile menu toggle */}
             <button
-              onClick={onToggleTheme}
-              className="w-full text-left px-4 py-2 rounded-lg text-sm font-medium text-surface-300 hover:bg-surface-800/50"
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              className="md:hidden p-2 text-zinc-400 hover:text-zinc-100"
             >
-              {darkMode ? '☀️ Light Mode' : '🌙 Dark Mode'}
+              {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
-            {isAuthenticated ? (
-              <button
-                onClick={() => { onLogout(); setMobileMenuOpen(false) }}
-                className="w-full text-left px-4 py-2 rounded-lg text-sm font-medium text-red-400 hover:bg-red-500/10"
-              >
-                Logout
-              </button>
-            ) : (
-              <Link
-                to="/login"
-                onClick={() => setMobileMenuOpen(false)}
-                className="block px-4 py-2 rounded-lg text-sm font-medium bg-brand-600 text-white text-center"
-              >
-                Sign In
-              </Link>
-            )}
           </div>
-        )}
+        </div>
       </div>
-    </nav>
+
+      {/* Mobile Navigation Drawer */}
+      {mobileMenuOpen && (
+        <div className="md:hidden border-t border-zinc-800/80 bg-zinc-950 px-4 py-3 space-y-2">
+          <Link
+            to="/"
+            onClick={() => setMobileMenuOpen(false)}
+            className="block py-2 text-sm text-zinc-300 hover:text-white"
+          >
+            Scans
+          </Link>
+          <Link
+            to="/history"
+            onClick={() => setMobileMenuOpen(false)}
+            className="block py-2 text-sm text-zinc-300 hover:text-white"
+          >
+            History
+          </Link>
+          <Link
+            to="/history"
+            onClick={() => setMobileMenuOpen(false)}
+            className="block py-2 text-sm text-zinc-300 hover:text-white"
+          >
+            Reports
+          </Link>
+          <Link
+            to="/terms"
+            onClick={() => setMobileMenuOpen(false)}
+            className="block py-2 text-sm text-zinc-300 hover:text-white"
+          >
+            Docs
+          </Link>
+          {isAuthenticated && (
+            <button
+              onClick={() => {
+                onLogout()
+                setMobileMenuOpen(false)
+              }}
+              className="block w-full text-left py-2 text-sm text-red-400 hover:text-red-300"
+            >
+              Sign out
+            </button>
+          )}
+        </div>
+      )}
+    </header>
   )
 }

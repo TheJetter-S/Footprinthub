@@ -7,6 +7,7 @@ import RegisterPage from './pages/RegisterPage'
 import DashboardPage from './pages/DashboardPage'
 import HistoryPage from './pages/HistoryPage'
 import TermsPage from './pages/TermsPage'
+import Footer from './components/layout/Footer'
 
 function App() {
   const [token, setToken] = useState<string | null>(
@@ -81,6 +82,7 @@ function App() {
           <Route path="/terms" element={<TermsPage />} />
         </Routes>
       </main>
+      <Footer />
     </div>
   )
 }
