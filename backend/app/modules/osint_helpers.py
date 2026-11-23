@@ -7,6 +7,7 @@
 # =============================================================================
 
 import asyncio
+import hashlib
 import html
 import json
 import re
@@ -15,6 +16,12 @@ from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 import httpx
+
+try:
+    import dns.resolver
+    HAS_DNS = True
+except ImportError:
+    HAS_DNS = False
 
 
 class SocialMediaScraper:
@@ -320,6 +327,359 @@ class SocialMediaScraper:
             pass
 
         return intel
+
+
+class ContactMetadataExtractor:
+    """Extracts telephone numbers and street addresses from crawled website content."""
+
+    PHONE_REGEX = re.compile(
+        r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b"
+    )
+
+    @classmethod
+    def extract_phone_numbers(cls, html_text: str) -> list[dict[str, str]]:
+        phones = []
+        seen = set()
+        for m in re.finditer(r'href=[\'"]tel:([^\'"]+)[\'"]', html_text, re.IGNORECASE):
+            raw = m.group(1).strip()
+            clean = re.sub(r"[^\d+]", "", raw)
+            if clean and clean not in seen and len(clean) >= 7:
+                seen.add(clean)
+                phones.append({"number": raw, "type": "tel_link"})
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        text = soup.get_text(separator=" ")
+        for match in cls.PHONE_REGEX.finditer(text):
+            num = match.group(0).strip()
+            digits = re.sub(r"\D", "", num)
+            if 7 <= len(digits) <= 15 and digits not in seen:
+                seen.add(digits)
+                phones.append({"number": num, "type": "text_mention"})
+        return phones
+
+    @classmethod
+    def extract_physical_addresses(cls, html_text: str) -> list[dict[str, Any] | str]:
+        addresses = []
+        soup = BeautifulSoup(html_text, "html.parser")
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                if isinstance(data, dict):
+                    if data.get("@type") == "PostalAddress":
+                        addresses.append(data)
+                    elif "address" in data and isinstance(data["address"], dict):
+                        addresses.append(data["address"])
+            except Exception:
+                pass
+
+        for addr in soup.find_all("address"):
+            txt = addr.get_text(strip=True)
+            if txt and len(txt) > 10:
+                addresses.append(txt)
+
+        return addresses
+
+
+class RDAPService:
+    """Passively queries IANA/RIR RDAP bootstrap service for official domain registration metadata."""
+
+    BOOTSTRAP_URL = "https://rdap.org/domain/"
+
+    @classmethod
+    async def query_rdap(
+        cls, domain: str, client: Optional[httpx.AsyncClient] = None
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "domain": domain,
+            "registrar": None,
+            "registered_date": None,
+            "expiration_date": None,
+            "status": [],
+            "nameservers": [],
+        }
+        url = f"{cls.BOOTSTRAP_URL}{domain}"
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+            close_client = True
+
+        try:
+            resp = await client.get(url, headers={"Accept": "application/rdap+json, application/json"})
+            if resp.status_code == 200:
+                data = resp.json()
+                result["domain"] = data.get("ldhName") or domain
+                result["status"] = data.get("status") or []
+
+                for entity in data.get("entities", []):
+                    if "registrar" in entity.get("roles", []):
+                        vcard = entity.get("vcardArray")
+                        if vcard and len(vcard) > 1:
+                            for item in vcard[1]:
+                                if len(item) > 3 and item[0] == "fn":
+                                    result["registrar"] = item[3]
+                                    break
+                    if result["registrar"]:
+                        break
+
+                for event in data.get("events", []):
+                    action = event.get("eventAction", "")
+                    date_val = event.get("eventDate", "")
+                    if action in ("registration", "registered") and not result["registered_date"]:
+                        result["registered_date"] = date_val
+                    elif action in ("expiration", "expires") and not result["expiration_date"]:
+                        result["expiration_date"] = date_val
+
+                for ns in data.get("nameservers", []):
+                    ns_name = ns.get("ldhName")
+                    if ns_name:
+                        result["nameservers"].append(ns_name)
+        except Exception:
+            pass
+        finally:
+            if close_client:
+                await client.aclose()
+
+        return result
+
+
+class SecretPatternScanner:
+    """
+    Detects exposed API tokens, access keys, and credentials in public code and configs.
+    CRITICAL SECURITY MANDATE:
+    NEVER stores or displays the raw secret value; all secret values are strictly masked!
+    """
+
+    PATTERNS = [
+        {
+            "name": "AWS Access Key ID",
+            "regex": r"\b(AKIA[0-9A-Z]{16})\b",
+            "mask": lambda m: m[:4] + "*" * 12 + m[-4:],
+            "severity": "high",
+        },
+        {
+            "name": "AWS Secret Access Key",
+            "regex": r"(?i)aws_secret_access_key\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?",
+            "mask": lambda m: m[:3] + "*" * 34 + m[-3:],
+            "severity": "critical",
+        },
+        {
+            "name": "GitHub Personal Access Token",
+            "regex": r"\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{30,})\b",
+            "mask": lambda m: m[:4] + "*" * (len(m) - 8) + m[-4:],
+            "severity": "high",
+        },
+        {
+            "name": "Slack Token",
+            "regex": r"\b(xox[baprs]-[0-9a-zA-Z]{10,48})\b",
+            "mask": lambda m: m[:4] + "*" * (len(m) - 8) + m[-4:],
+            "severity": "high",
+        },
+        {
+            "name": "Private Cryptographic Key",
+            "regex": r"-----BEGIN (?:RSA|EC|DSA|OPENSSH)? PRIVATE KEY-----",
+            "mask": lambda m: "[MASKED PRIVATE CRYPTOGRAPHIC KEY]",
+            "severity": "critical",
+        },
+        {
+            "name": "Generic Database Password / Secret",
+            "regex": r"(?i)(?:db_password|database_url|api_secret|client_secret)\s*[:=]\s*['\"]([^'\"\s]{8,})['\"]",
+            "mask": lambda m: m[:2] + "*" * (len(m) - 4) + m[-2:],
+            "severity": "high",
+        },
+    ]
+
+    @classmethod
+    def scan_content(cls, content: str, source_url: str = "") -> list[dict[str, Any]]:
+        findings = []
+        for p in cls.PATTERNS:
+            for match in re.finditer(p["regex"], content):
+                raw_match = match.group(1) if match.groups() else match.group(0)
+                masked = p["mask"](raw_match)
+                findings.append({
+                    "secret_type": p["name"],
+                    "masked_value": masked,
+                    "source_url": source_url,
+                    "severity": p["severity"],
+                })
+        return findings
+
+
+class CodeLeakEngine:
+    """
+    Queries official public APIs and registries to identify public code repositories,
+    container images, package registry publications, and Postman workspaces.
+    """
+
+    @classmethod
+    async def search_leaks(
+        cls,
+        domain: str,
+        company_name: str = "",
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> dict[str, Any]:
+        results: dict[str, Any] = {
+            "github_repos": [],
+            "gitlab_projects": [],
+            "docker_hub_images": [],
+            "npm_packages": [],
+            "pypi_packages": [],
+            "postman_workspaces": [],
+            "detected_secrets": [],
+        }
+        term = company_name or domain.split(".")[0]
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+            close_client = True
+
+        headers = {"User-Agent": "FootprintHub-CodeAudit"}
+
+        try:
+            # 1. GitHub public repositories search
+            try:
+                gh_resp = await client.get(
+                    f"https://api.github.com/search/repositories?q={urllib.parse.quote(term)}&sort=stars&order=desc",
+                    headers=headers,
+                )
+                if gh_resp.status_code == 200:
+                    items = gh_resp.json().get("items", [])
+                    for it in items[:10]:
+                        desc = it.get("description") or ""
+                        results["github_repos"].append({
+                            "name": it.get("full_name"),
+                            "url": it.get("html_url"),
+                            "description": desc,
+                            "stars": it.get("stargazers_count", 0),
+                            "updated_at": it.get("updated_at"),
+                        })
+                        if desc:
+                            secrets = SecretPatternScanner.scan_content(desc, it.get("html_url", ""))
+                            results["detected_secrets"].extend(secrets)
+            except Exception:
+                pass
+
+            # 2. GitLab public projects search
+            try:
+                gl_resp = await client.get(
+                    f"https://gitlab.com/api/v4/projects?search={urllib.parse.quote(term)}&per_page=10",
+                    headers=headers,
+                )
+                if gl_resp.status_code == 200:
+                    for it in gl_resp.json()[:10]:
+                        results["gitlab_projects"].append({
+                            "name": it.get("name"),
+                            "url": it.get("web_url"),
+                            "description": it.get("description"),
+                            "stars": it.get("star_count", 0),
+                        })
+            except Exception:
+                pass
+
+            # 3. Docker Hub public image search
+            try:
+                dh_resp = await client.get(
+                    f"https://hub.docker.com/v2/search/repositories/?query={urllib.parse.quote(term)}&page_size=10",
+                    headers=headers,
+                )
+                if dh_resp.status_code == 200:
+                    for it in dh_resp.json().get("results", [])[:10]:
+                        results["docker_hub_images"].append({
+                            "name": it.get("repo_name"),
+                            "description": it.get("short_description"),
+                            "pull_count": it.get("pull_count", 0),
+                        })
+            except Exception:
+                pass
+
+            # 4. npm packages search
+            try:
+                npm_resp = await client.get(
+                    f"https://registry.npmjs.org/-/v1/search?text={urllib.parse.quote(term)}&size=10",
+                    headers=headers,
+                )
+                if npm_resp.status_code == 200:
+                    for it in npm_resp.json().get("objects", [])[:10]:
+                        pkg = it.get("package", {})
+                        results["npm_packages"].append({
+                            "name": pkg.get("name"),
+                            "version": pkg.get("version"),
+                            "description": pkg.get("description"),
+                        })
+            except Exception:
+                pass
+
+            # 5. PyPI package check
+            try:
+                pypi_resp = await client.get(
+                    f"https://pypi.org/pypi/{urllib.parse.quote(term)}/json",
+                    headers=headers,
+                )
+                if pypi_resp.status_code == 200:
+                    info = pypi_resp.json().get("info", {})
+                    results["pypi_packages"].append({
+                        "name": info.get("name"),
+                        "version": info.get("version"),
+                        "summary": info.get("summary"),
+                        "url": info.get("package_url"),
+                    })
+            except Exception:
+                pass
+
+            # 6. Postman public workspace footprint
+            results["postman_workspaces"].append({
+                "query": term,
+                "url": f"https://www.postman.com/search?q={urllib.parse.quote(term)}&type=workspaces",
+                "status": "query_ready",
+            })
+
+        finally:
+            if close_client:
+                await client.aclose()
+
+        return results
+
+
+class DomainOwnershipVerifier:
+    """Verifies domain ownership prior to domain-wide credential breach searches."""
+
+    @classmethod
+    async def verify_ownership(
+        cls,
+        domain: str,
+        client: Optional[httpx.AsyncClient] = None,
+        token: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        expected_token = token or "footprinthub-verification"
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+            close_client = True
+
+        try:
+            if HAS_DNS:
+                try:
+                    answers = dns.resolver.resolve(f"_footprinthub-challenge.{domain}", "TXT")
+                    for rdata in answers:
+                        txt_val = "".join([b.decode("utf-8", errors="ignore") for b in rdata.strings])
+                        if expected_token in txt_val:
+                            return True, f"Verified via DNS TXT record for {domain}"
+                except Exception:
+                    pass
+
+            for scheme in ["https", "http"]:
+                try:
+                    url = f"{scheme}://{domain}/.well-known/footprinthub-verification.txt"
+                    resp = await client.get(url)
+                    if resp.status_code == 200 and expected_token in resp.text:
+                        return True, f"Verified via HTTP file at {url}"
+                except Exception:
+                    pass
+
+            return False, f"Unverified: No DNS challenge or /.well-known verification file detected for {domain}"
+
+        finally:
+            if close_client:
+                await client.aclose()
 
 
 class CompanyMetadataScraper:
