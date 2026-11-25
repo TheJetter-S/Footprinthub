@@ -28,12 +28,21 @@ class FindingSeverity(str, Enum):
     INFO = "info"
 
 
+class FindingConfidence(str, Enum):
+    """Confidence levels for security findings."""
+    CONFIRMED = "confirmed"
+    LIKELY = "likely"
+    POSSIBLE = "possible"
+
+
 class ModuleFinding(BaseModel):
     """A single security finding produced by a module."""
     severity: FindingSeverity
     title: str
     description: str
     remediation: Optional[str] = None
+    confidence: FindingConfidence = FindingConfidence.CONFIRMED
+    evidence: Optional[str] = None
 
 
 class ModuleResult(BaseModel):

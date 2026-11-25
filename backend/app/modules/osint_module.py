@@ -22,6 +22,7 @@ from app.modules.osint_helpers import (
     LinkedInOSINTEngine,
     CompanyDigitalFootprintEngine,
     WebsiteIntelligenceEngine,
+    PublicKnowledgeHarvester,
 )
 from app.modules.base import (
     BaseModule,
@@ -561,15 +562,61 @@ class OSINTModule(BaseModule):
         paths_to_crawl = [
             "",
             "/about-us",
+            "/about-us/",
             "/about",
+            "/about/",
+            "/about.php",
+            "/about-us.php",
+            "/aboutus",
+            "/aboutus/",
+            "/aboutus.php",
+            "/aboutus.html",
+            "/about.html",
+            "/company",
+            "/company/",
+            "/company.html",
+            "/company.php",
             "/contact",
+            "/contact/",
+            "/contact.php",
             "/contact-us",
+            "/contact-us/",
+            "/contact-us.php",
+            "/contactus.html",
+            "/contactus.php",
             "/team",
+            "/team/",
+            "/team.php",
+            "/our-team",
+            "/our-team/",
+            "/our-team.php",
+            "/meet-the-team",
+            "/meet-the-team/",
+            "/leadership",
+            "/leadership/",
+            "/leadership.php",
+            "/leaders",
+            "/leaders/",
+            "/our-leaders",
+            "/people",
+            "/people/",
+            "/people.php",
+            "/who-we-are",
+            "/who-we-are/",
+            "/who-we-are.php",
+            "/our-story",
+            "/our-story/",
+            "/story",
+            "/story/",
+            "/founders",
+            "/founders/",
+            "/management",
+            "/management/",
         ]
 
         # Use a persistent client with realistic browser headers and safe timeouts
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 FootprintHub/1.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
@@ -608,11 +655,16 @@ class OSINTModule(BaseModule):
                 for raw_link in all_raw_links:
                     raw_link = raw_link.strip()
                     lower_link = raw_link.lower()
-                    if any(kw in lower_link for kw in ["about", "team", "founder", "people", "leadership", "contact", "company", "who-we-are"]):
-                        if raw_link.startswith("/") and not raw_link.startswith("//"):
-                            path_only = raw_link.split("?")[0].split("#")[0]
-                            if path_only and path_only not in paths_to_crawl:
-                                paths_to_crawl.append(path_only)
+                    if any(kw in lower_link for kw in ["about", "team", "founder", "people", "leadership", "contact", "company", "who-we-are", "connect", "reach", "management", "board", "executive", "story"]):
+                        clean_href = raw_link.split("?")[0].split("#")[0].strip()
+                        if clean_href.startswith("./"):
+                            clean_href = "/" + clean_href[2:]
+                        elif not clean_href.startswith("/") and not clean_href.startswith("http"):
+                            clean_href = "/" + clean_href
+
+                        if clean_href.startswith("/") and not clean_href.startswith("//"):
+                            if clean_href not in paths_to_crawl:
+                                paths_to_crawl.append(clean_href)
                         elif clean_target in lower_link or base_domain in lower_link:
                             try:
                                 parsed = urllib.parse.urlparse(raw_link)
@@ -621,17 +673,18 @@ class OSINTModule(BaseModule):
                             except Exception:
                                 pass
 
-            # Filter unique non-empty paths and limit to top 6 to guarantee speed
-            remaining_paths = [p for p in dict.fromkeys(paths_to_crawl) if p != ""][:6]
+            # Filter unique non-empty paths and crawl concurrently
+            remaining_paths = [p for p in dict.fromkeys(paths_to_crawl) if p != ""][:20]
 
             async def _crawl_path(path: str) -> str:
-                try:
-                    url = f"https://{active_host}{path}"
-                    resp = await client.get(url, timeout=5.0)
-                    if resp.status_code == 200 and resp.text:
-                        return resp.text
-                except Exception:
-                    pass
+                for scheme in ["https", "http"]:
+                    try:
+                        url = f"{scheme}://{active_host}{path}"
+                        resp = await client.get(url, timeout=5.0)
+                        if resp.status_code == 200 and resp.text:
+                            return resp.text
+                    except Exception:
+                        pass
                 return ""
 
             if remaining_paths:
@@ -682,6 +735,48 @@ class OSINTModule(BaseModule):
             company_meta = CompanyMetadataScraper.extract_company_metadata(normalized_html, base_domain, company_name)
             if company_meta.get("name") and company_meta["name"] != company_name:
                 company_name = company_meta["name"]
+
+            # If company description is sparse, fallback to extracted About narrative
+            if company_meta.get("about_company") and (not company_meta.get("description") or len(company_meta.get("description", "")) < 30):
+                company_meta["description"] = company_meta["about_company"]
+
+            # Query open knowledge repositories (Wikipedia, Wikidata & public graphs)
+            wiki_intel: dict[str, Any] = {}
+            try:
+                self._progress(on_progress, 28, f"Querying open knowledge bases for {company_name}...")
+                wiki_intel = await PublicKnowledgeHarvester.harvest_public_knowledge(company_name, base_domain, client=client)
+                if wiki_intel.get("description") and not company_meta.get("description"):
+                    company_meta["description"] = wiki_intel["description"]
+                if wiki_intel.get("industry") and not company_meta.get("industry"):
+                    company_meta["industry"] = wiki_intel["industry"]
+                if wiki_intel.get("headquarters") and not company_meta.get("headquarters"):
+                    company_meta["headquarters"] = wiki_intel["headquarters"]
+                if wiki_intel.get("estimated_employees") and not company_meta.get("estimated_employees"):
+                    company_meta["estimated_employees"] = wiki_intel["estimated_employees"]
+                for f in wiki_intel.get("founders", []):
+                    existing = next((ef for ef in company_meta.get("founders", []) if ef.get("name", "").lower() == f.get("name", "").lower()), None)
+                    if existing:
+                        for k, v in f.items():
+                            if v and not existing.get(k):
+                                existing[k] = v
+                    else:
+                        company_meta.setdefault("founders", []).append(f)
+                if wiki_intel.get("candidate_slugs"):
+                    company_meta.setdefault("candidate_slugs", []).extend(wiki_intel["candidate_slugs"])
+            except Exception:
+                pass
+
+            # Enrich discovered founders with executive portrait discovery if missing photo
+            if company_meta.get("founders"):
+                for f in company_meta["founders"][:4]:
+                    if not f.get("photo_url"):
+                        try:
+                            f_img = await PublicKnowledgeHarvester.search_person_image(f["name"], company_name, client=client)
+                            if f_img:
+                                f["photo_url"] = f_img
+                                f["avatar_url"] = f_img
+                        except Exception:
+                            pass
 
             # Merge any contact emails discovered in company_meta into emails_found
             for c_em in company_meta.get("contact_emails", []):
@@ -805,13 +900,14 @@ class OSINTModule(BaseModule):
             self._progress(on_progress, 72, "Compiling LinkedIn Corporate Intelligence, Employee Directory & Founders...")
 
             # ── LinkedIn Corporate Intelligence Engine ──────────────────────────
-            linkedin_intelligence = LinkedInOSINTEngine.build_linkedin_intelligence(
+            linkedin_intelligence = await LinkedInOSINTEngine.fetch_and_build_linkedin_intelligence(
                 domain=base_domain,
                 company_name=company_name,
                 website_social_profiles=website_social_profiles,
                 company_meta=company_meta,
                 github_intel=github_intel,
                 enriched_email_profiles=behind_the_email_profiles,
+                client=client,
             )
 
             # ── Digital Footprint & Registries Engine ───────────────────────────
@@ -942,6 +1038,7 @@ class OSINTModule(BaseModule):
                     "domain": base_domain,
                     "company_name": company_name,
                     "company_metadata": company_meta,
+                    "public_knowledge": wiki_intel,
                     "digital_footprint": digital_footprint,
                     "internet_intelligence": internet_intelligence,
                     "linkedin_intelligence": linkedin_intelligence,

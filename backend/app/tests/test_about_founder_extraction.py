@@ -50,5 +50,94 @@ class TestAboutFounderExtraction(unittest.TestCase):
         self.assertEqual(founders[0]["title"], "Founder & Chief Technology Officer")
         self.assertEqual(founders[0]["photo_url"], "https://techco.com/assets/team1.jpg")
 
+    def test_learnlike_leadership_team_cards(self):
+        html = """
+        <div class="leaders-section">
+            <div class="leader-card">
+                <img src="/images/deepak.jpg" alt="Deepak Ravikumar" />
+                <h3>Deepak Ravikumar</h3>
+                <span class="role">Founder & CEO</span>
+                <p>Visionary CEO driving education transformation through innovation and strategic leadership.</p>
+                <a href="https://www.linkedin.com/in/deepak-ravikumar">in</a>
+            </div>
+            <div class="leader-card">
+                <img src="/images/thiyagarajan.jpg" alt="Thiyagarajan P" />
+                <h3>Thiyagarajan P</h3>
+                <span class="role">Chief Operating Officer</span>
+                <p>Expert in operational excellence and scaling educational services.</p>
+                <a href="https://www.linkedin.com/in/thiyagarajan-p">in</a>
+            </div>
+            <div class="leader-card">
+                <img src="/images/srihari.jpg" alt="Srihari Ravikumar" />
+                <h3>Srihari Ravikumar</h3>
+                <span class="role">Chief Technology Officer (CTO)</span>
+                <p>Responsible for integrating advanced technologies to enhance learning experiences.</p>
+                <a href="https://www.linkedin.com/in/srihari-ravikumar">in</a>
+            </div>
+            <div class="leader-card">
+                <img src="/images/jamuna.jpg" alt="Jamuna Devi" />
+                <h3>Jamuna Devi</h3>
+                <span class="role">HR Director</span>
+                <p>Leads people operations and talent development while building a supportive culture.</p>
+                <a href="https://www.linkedin.com/in/jamuna-devi">in</a>
+            </div>
+        </div>
+        """
+        res = CompanyMetadataScraper.extract_company_metadata(html, "learnlike.in", "Learnlike")
+        founders = res.get("founders", [])
+        self.assertEqual(len(founders), 4)
+        names = [f["name"] for f in founders]
+        self.assertIn("Deepak Ravikumar", names)
+        self.assertIn("Thiyagarajan P", names)
+        self.assertIn("Srihari Ravikumar", names)
+        self.assertIn("Jamuna Devi", names)
+
+        # Check titles & photos
+        deepak = next(f for f in founders if f["name"] == "Deepak Ravikumar")
+        self.assertEqual(deepak["title"], "Founder & CEO")
+        self.assertEqual(deepak["photo_url"], "https://learnlike.in/images/deepak.jpg")
+
+        thiyagarajan = next(f for f in founders if f["name"] == "Thiyagarajan P")
+        self.assertEqual(thiyagarajan["title"], "Chief Operating Officer")
+
+    def test_linkedin_followers_not_promoted_to_founders(self):
+        from app.modules.osint_helpers import LinkedInOSINTEngine
+        company_meta = {"founders": [], "scraped_team": []}
+        crawled_employees = [
+            {
+                "name": "Padmesh K A",
+                "title": "Associated Professional / Follower",
+                "department": "Operations & Business",
+                "is_founder": False,
+            },
+            {
+                "name": "Rajapandi N",
+                "title": "Associated Professional / Follower",
+                "department": "Operations & Business",
+                "is_founder": False,
+            },
+            {
+                "name": "Deepak Ravikumar",
+                "title": "Founder & CEO",
+                "department": "Executive Leadership",
+                "is_founder": True,
+            }
+        ]
+        intel = LinkedInOSINTEngine.build_linkedin_intelligence(
+            domain="learnlike.in",
+            company_name="Learnlike",
+            website_social_profiles=[],
+            company_meta=company_meta,
+            github_intel={},
+            enriched_email_profiles=[],
+            crawled_linkedin_employees=crawled_employees,
+        )
+        founder_names = [f["name"] for f in intel["founders"]]
+        self.assertIn("Deepak Ravikumar", founder_names)
+        self.assertNotIn("Padmesh K A", founder_names)
+        self.assertNotIn("Rajapandi N", founder_names)
+        self.assertEqual(len(intel["founders"]), 1)
+        self.assertEqual(len(intel["employees"]), 3)
+
 if __name__ == "__main__":
     unittest.main()
