@@ -10,12 +10,130 @@ import asyncio
 import hashlib
 import html
 import json
+import logging
 import re
+import time
 import urllib.parse
+import urllib.robotparser
 from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 import httpx
+
+from app.config import settings
+from app.core.safe_request import safe_request, USER_AGENT as SAFE_USER_AGENT
+
+logger = logging.getLogger("footprinthub.osint")
+
+# In-memory TTL cache for Wikipedia / Wikidata / search / robots.txt
+_OSINT_RESPONSE_CACHE: dict[str, tuple[float, httpx.Response]] = {}
+_ROBOTS_CACHE: dict[str, tuple[float, Optional[urllib.robotparser.RobotFileParser]]] = {}
+
+
+def validate_image_url(url: Optional[str], base_domain: str = "") -> Optional[str]:
+    """Validate and normalize public image URLs (rejects data URIs and unsafe schemes)."""
+    if not url or not isinstance(url, str):
+        return None
+    u = url.strip()
+    if not u or u.startswith("data:") or u.startswith("javascript:"):
+        return None
+    if u.startswith("//"):
+        u = f"https:{u}"
+    elif u.startswith("/") and base_domain:
+        clean_host = base_domain.replace("https://", "").replace("http://", "").split("/")[0]
+        u = f"https://{clean_host}{u}"
+    if not u.startswith(("http://", "https://")):
+        return None
+    if " " in u:
+        u = u.replace(" ", "%20")
+    return u
+
+
+async def safe_osint_request(
+    method: str,
+    url: str,
+    *,
+    client: Optional[Any] = None,
+    headers: Optional[dict[str, str]] = None,
+    params: Optional[dict[str, Any]] = None,
+    timeout: float = 8.0,
+    retries: int = 1,
+    max_size: Optional[int] = None,
+    cache_ttl: float = 0.0,
+) -> Optional[httpx.Response]:
+    """
+    Execute an outbound OSINT HTTP request through SSRF-guarded `safe_request`,
+    with optional in-memory TTL caching and retries. Honors injected mock `client` in tests.
+    """
+    cache_key = f"{method.upper()}:{url}:{json.dumps(params or {}, sort_keys=True)}"
+    if cache_ttl > 0 and method.upper() == "GET" and client is None:
+        cached = _OSINT_RESPONSE_CACHE.get(cache_key)
+        if cached and (time.time() - cached[0]) < cache_ttl:
+            return cached[1]
+
+    req_headers = {"User-Agent": SAFE_USER_AGENT}
+    if headers:
+        req_headers.update(headers)
+
+    for attempt in range(max(1, retries + 1)):
+        try:
+            if client is not None and type(client) is not httpx.AsyncClient:
+                # Injected mock test client
+                if method.upper() == "HEAD" and hasattr(client, "head"):
+                    resp = await client.head(url, headers=req_headers, timeout=timeout)
+                else:
+                    try:
+                        resp = await client.get(url, headers=req_headers, params=params, timeout=timeout)
+                    except TypeError:
+                        resp = await client.get(url, headers=req_headers, timeout=timeout)
+            else:
+                resp = await safe_request(
+                    method,
+                    url,
+                    headers=req_headers,
+                    params=params,
+                    timeout=timeout,
+                    max_size=max_size or getattr(settings, "MAX_RESPONSE_SIZE_BYTES", 10_485_760),
+                    follow_redirects=True,
+                )
+            if cache_ttl > 0 and method.upper() == "GET" and client is None and getattr(resp, "status_code", 0) == 200:
+                _OSINT_RESPONSE_CACHE[cache_key] = (time.time(), resp)
+            return resp
+        except Exception as exc:
+            if attempt >= retries:
+                logger.debug("safe_osint_request failed (%s %s): %s", method, url, exc)
+                return None
+            await asyncio.sleep(0.25)
+    return None
+
+
+class RobotsTxtGuard:
+    """Checks and caches robots.txt rules per crawled host via safe_osint_request."""
+
+    @classmethod
+    async def is_allowed(cls, host_base_url: str, path: str, client: Optional[Any] = None) -> bool:
+        clean_base = host_base_url.rstrip("/")
+        cached = _ROBOTS_CACHE.get(clean_base)
+        now = time.time()
+        parser: Optional[urllib.robotparser.RobotFileParser] = None
+        if cached and (now - cached[0]) < 1800.0:
+            parser = cached[1]
+        else:
+            robots_url = f"{clean_base}/robots.txt"
+            resp = await safe_osint_request("GET", robots_url, client=client, timeout=3.5, retries=0, max_size=512_000)
+            if resp is not None and getattr(resp, "status_code", 0) == 200 and getattr(resp, "text", ""):
+                rp = urllib.robotparser.RobotFileParser()
+                rp.parse(resp.text.splitlines())
+                parser = rp
+            _ROBOTS_CACHE[clean_base] = (now, parser)
+
+        if parser is None:
+            return True
+        try:
+            target_path = path if path.startswith("/") else f"/{path}"
+            return parser.can_fetch(SAFE_USER_AGENT, target_path) and parser.can_fetch("*", target_path)
+        except Exception:
+            return True
 
 try:
     import dns.resolver
@@ -244,13 +362,16 @@ class SocialMediaScraper:
         }
 
         try:
-            # Try as organization first
-            resp = await client.get(
+            # Try as organization first via safe_osint_request
+            resp = await safe_osint_request(
+                "GET",
                 f"https://api.github.com/orgs/{github_handle}",
+                client=client,
                 headers=headers,
                 timeout=8.0,
+                cache_ttl=900.0,
             )
-            if resp.status_code == 200:
+            if resp is not None and resp.status_code == 200:
                 org = resp.json()
                 intel["type"] = "organization"
                 intel["profile"] = {
@@ -268,80 +389,81 @@ class SocialMediaScraper:
                 }
 
                 # Get public members (up to 8 to respect rate limits)
-                try:
-                    members_resp = await client.get(
-                        f"https://api.github.com/orgs/{github_handle}/public_members?per_page=15",
-                        headers=headers,
-                        timeout=8.0,
-                    )
-                    if members_resp.status_code == 200:
-                        member_logins = members_resp.json()[:8]
-                        member_tasks = [
-                            client.get(
-                                f"https://api.github.com/users/{m['login']}",
-                                headers=headers,
-                                timeout=5.0,
-                            )
-                            for m in member_logins
-                        ]
-                        member_results = await asyncio.gather(
-                            *member_tasks, return_exceptions=True
+                members_resp = await safe_osint_request(
+                    "GET",
+                    f"https://api.github.com/orgs/{github_handle}/public_members?per_page=15",
+                    client=client,
+                    headers=headers,
+                    timeout=8.0,
+                    cache_ttl=900.0,
+                )
+                if members_resp is not None and members_resp.status_code == 200:
+                    member_logins = members_resp.json()[:8]
+                    member_tasks = [
+                        safe_osint_request(
+                            "GET",
+                            f"https://api.github.com/users/{m['login']}",
+                            client=client,
+                            headers=headers,
+                            timeout=5.0,
+                            cache_ttl=900.0,
                         )
-                        for mr in member_results:
-                            if (
-                                isinstance(mr, httpx.Response)
-                                and mr.status_code == 200
-                            ):
-                                m_data = mr.json()
-                                intel["members"].append(
-                                    {
-                                        "login": m_data.get("login"),
-                                        "name": m_data.get("name") or m_data.get("login"),
-                                        "bio": m_data.get("bio"),
-                                        "company": m_data.get("company"),
-                                        "location": m_data.get("location"),
-                                        "email": m_data.get("email"),
-                                        "avatar_url": m_data.get("avatar_url"),
-                                        "html_url": m_data.get("html_url"),
-                                        "public_repos": m_data.get("public_repos", 0),
-                                        "followers": m_data.get("followers", 0),
-                                        "twitter": m_data.get("twitter_username"),
-                                    }
-                                )
-                except Exception:
-                    pass
-
-                # Get top repositories
-                try:
-                    repos_resp = await client.get(
-                        f"https://api.github.com/orgs/{github_handle}/repos?sort=stars&direction=desc&per_page=10",
-                        headers=headers,
-                        timeout=8.0,
-                    )
-                    if repos_resp.status_code == 200:
-                        for r in repos_resp.json():
-                            intel["top_repos"].append(
+                        for m in member_logins
+                    ]
+                    member_results = await asyncio.gather(*member_tasks, return_exceptions=True)
+                    for mr in member_results:
+                        if mr is not None and not isinstance(mr, Exception) and getattr(mr, "status_code", 0) == 200:
+                            m_data = mr.json()
+                            intel["members"].append(
                                 {
-                                    "name": r.get("name"),
-                                    "description": r.get("description"),
-                                    "stars": r.get("stargazers_count", 0),
-                                    "forks": r.get("forks_count", 0),
-                                    "language": r.get("language"),
-                                    "html_url": r.get("html_url"),
-                                    "updated_at": (r.get("updated_at") or "")[:10],
+                                    "login": m_data.get("login"),
+                                    "name": m_data.get("name") or m_data.get("login"),
+                                    "bio": m_data.get("bio"),
+                                    "company": m_data.get("company"),
+                                    "location": m_data.get("location"),
+                                    "email": m_data.get("email"),
+                                    "avatar_url": m_data.get("avatar_url"),
+                                    "html_url": m_data.get("html_url"),
+                                    "public_repos": m_data.get("public_repos", 0),
+                                    "followers": m_data.get("followers", 0),
+                                    "twitter": m_data.get("twitter_username"),
                                 }
                             )
-                except Exception:
-                    pass
+
+                # Get top repositories
+                repos_resp = await safe_osint_request(
+                    "GET",
+                    f"https://api.github.com/orgs/{github_handle}/repos?sort=stars&direction=desc&per_page=10",
+                    client=client,
+                    headers=headers,
+                    timeout=8.0,
+                    cache_ttl=900.0,
+                )
+                if repos_resp is not None and repos_resp.status_code == 200:
+                    for r in repos_resp.json():
+                        intel["top_repos"].append(
+                            {
+                                "name": r.get("name"),
+                                "description": r.get("description"),
+                                "stars": r.get("stargazers_count", 0),
+                                "forks": r.get("forks_count", 0),
+                                "language": r.get("language"),
+                                "html_url": r.get("html_url"),
+                                "updated_at": (r.get("updated_at") or "")[:10],
+                            }
+                        )
 
             else:
                 # Try as individual user
-                resp = await client.get(
+                resp = await safe_osint_request(
+                    "GET",
                     f"https://api.github.com/users/{github_handle}",
+                    client=client,
                     headers=headers,
                     timeout=8.0,
+                    cache_ttl=900.0,
                 )
-                if resp.status_code == 200:
+                if resp is not None and resp.status_code == 200:
                     user = resp.json()
                     intel["type"] = "user"
                     intel["profile"] = {
@@ -445,14 +567,9 @@ class RDAPService:
             "nameservers": [],
         }
         url = f"{cls.BOOTSTRAP_URL}{domain}"
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
-            close_client = True
-
         try:
-            resp = await client.get(url, headers={"Accept": "application/rdap+json, application/json"})
-            if resp.status_code == 200:
+            resp = await safe_osint_request("GET", url, client=client, headers={"Accept": "application/rdap+json, application/json"}, timeout=8.0, cache_ttl=1800.0)
+            if resp is not None and resp.status_code == 200:
                 data = resp.json()
                 result["domain"] = data.get("ldhName") or domain
                 result["status"] = data.get("status") or []
@@ -482,9 +599,6 @@ class RDAPService:
                         result["nameservers"].append(ns_name)
         except Exception:
             pass
-        finally:
-            if close_client:
-                await client.aclose()
 
         return result
 
@@ -959,6 +1073,8 @@ class CompanyMetadataScraper:
             "founded_source": None,
             "headquarters": js_intel.get("headquarters", ""),
             "estimated_employees": "11-50 employees",
+            "logo": None,
+            "same_as_links": [],
             "founders": [],
             "scraped_team": [],
             "json_ld_detected": False,
@@ -984,10 +1100,18 @@ class CompanyMetadataScraper:
         if meta["addresses"] and not meta["headquarters"]:
             meta["headquarters"] = meta["addresses"][0]
 
-        # 1. OpenGraph & Meta description
+        # 1. OpenGraph, Logo & Meta description
         og_site = soup.find("meta", property="og:site_name")
         if og_site and og_site.get("content"):
             meta["name"] = og_site["content"].strip()
+
+        og_img = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "twitter:image"})
+        if og_img and og_img.get("content"):
+            meta["logo"] = validate_image_url(og_img["content"], domain)
+        if not meta["logo"]:
+            icon_link = soup.find("link", rel=lambda r: r and "icon" in " ".join(r).lower() if isinstance(r, list) else (r and "icon" in r.lower()))
+            if icon_link and icon_link.get("href"):
+                meta["logo"] = validate_image_url(icon_link["href"], domain)
 
         og_desc = (
             soup.find("meta", property="og:description")
@@ -1081,6 +1205,17 @@ class CompanyMetadataScraper:
                         elif isinstance(addr, str):
                             meta["headquarters"] = addr
 
+                        if item.get("logo"):
+                            raw_logo = item["logo"].get("url") if isinstance(item["logo"], dict) else str(item["logo"])
+                            val_logo = validate_image_url(raw_logo, domain)
+                            if val_logo:
+                                meta["logo"] = val_logo
+                        if item.get("sameAs"):
+                            sa_list = item["sameAs"] if isinstance(item["sameAs"], list) else [item["sameAs"]]
+                            for sa_u in sa_list:
+                                if isinstance(sa_u, str) and sa_u.startswith(("http://", "https://")) and sa_u not in meta["same_as_links"]:
+                                    meta["same_as_links"].append(sa_u)
+
                         # Founders from Organization
                         f_raw = item.get("founder") or item.get("founders")
                         if f_raw:
@@ -1088,16 +1223,34 @@ class CompanyMetadataScraper:
                             for f in f_list:
                                 if isinstance(f, dict) and f.get("name"):
                                     f_name = str(f.get("name")).strip()
-                                    f_url = f.get("url") or f.get("sameAs") or ""
-                                    if isinstance(f_url, list):
-                                        f_url = next((u for u in f_url if "linkedin.com/in" in str(u)), f_url[0] if f_url else "")
+                                    raw_urls = []
+                                    for field_k in ("url", "sameAs"):
+                                        fv = f.get(field_k)
+                                        if isinstance(fv, list):
+                                            raw_urls.extend([str(u) for u in fv if u])
+                                        elif fv:
+                                            raw_urls.append(str(fv))
+                                    f_url = next((u for u in raw_urls if "linkedin.com/in" in u.lower()), "")
+                                    f_wiki = next((u for u in raw_urls if "wikipedia.org/wiki/" in u.lower()), "")
+                                    f_tw = next((u for u in raw_urls if "twitter.com/" in u.lower() or "x.com/" in u.lower()), "")
+                                    f_gh = next((u for u in raw_urls if "github.com/" in u.lower()), "")
+                                    f_img = f.get("image")
+                                    if isinstance(f_img, dict):
+                                        f_img = f_img.get("url")
                                     meta["founders"].append(
                                         {
                                             "name": f_name,
                                             "title": f.get("jobTitle") or "Founder",
                                             "linkedin_url": str(f_url),
+                                            "wikipedia_url": str(f_wiki),
+                                            "twitter_url": f_tw,
+                                            "github_url": f_gh,
+                                            "photo_url": validate_image_url(str(f_img), domain) if f_img else None,
+                                            "avatar_url": validate_image_url(str(f_img), domain) if f_img else None,
                                             "bio": f.get("description") or f"Company Founder of {company_name}",
                                             "source": "Schema.org Organization (JSON-LD)",
+                                            "sources": ["Schema.org Organization (JSON-LD)"],
+                                            "confidence": "HIGH",
                                         }
                                     )
                                 elif isinstance(f, str) and len(f.strip().split()) >= 2:
@@ -1108,6 +1261,8 @@ class CompanyMetadataScraper:
                                             "linkedin_url": "",
                                             "bio": f"Company Founder of {company_name}",
                                             "source": "Schema.org Organization (JSON-LD)",
+                                            "sources": ["Schema.org Organization (JSON-LD)"],
+                                            "confidence": "HIGH",
                                         }
                                     )
 
@@ -1222,6 +1377,8 @@ class CompanyMetadataScraper:
             photo: Optional[str] = None,
             li_url: str = "",
             source: str = "Website Text Mentions (About Section)",
+            twitter_url: str = "",
+            github_url: str = "",
         ) -> None:
             if not name:
                 return
@@ -1239,12 +1396,16 @@ class CompanyMetadataScraper:
                 "corporation", "review", "award", "products", "customers", "partners", "global", "leading",
                 "meet", "about", "learn", "read", "view", "see", "discover", "join", "visit", "explore",
                 "contact", "trusted", "why", "how", "build", "secure", "get", "start", "request", "postmans",
+                "product", "architect", "architecture", "chief", "officer", "director", "manager",
+                "engineer", "senior", "lead", "head", "operations", "sales", "marketing", "co",
             }
             if any(p.lower().rstrip("'s’") in stop for p in parts):
                 return
             norm_name = " ".join([p.capitalize() if p.islower() else p for p in parts])
             key = _norm_key(norm_name)
             clean_title = re.sub(r"\b(Ceo|Cto|Coo|Cfo|Ciso|Vp|Hr)\b", lambda m: m.group(1).upper(), (title or "Founder").strip())
+            valid_photo = validate_image_url(photo, domain)
+            clean_bio = re.sub(r"\s+", " ", bio).strip() if bio else ""
 
             if li_url:
                 s_li = _slug_from_li(li_url)
@@ -1254,14 +1415,22 @@ class CompanyMetadataScraper:
             if key in seen_founder_keys:
                 for f in meta["founders"]:
                     if _norm_key(f.get("name", "")) == key:
-                        if photo and not f.get("photo_url"):
-                            f["photo_url"] = photo
-                            f["avatar_url"] = photo
-                        if bio and (not f.get("bio") or len(f.get("bio", "")) < len(bio)):
-                            f["bio"] = bio
-                            f["bio_summary"] = bio
+                        if valid_photo and not f.get("photo_url"):
+                            f["photo_url"] = valid_photo
+                            f["avatar_url"] = valid_photo
+                        if clean_bio and (not f.get("bio") or len(f.get("bio", "")) < len(clean_bio)):
+                            f["bio"] = clean_bio
+                            f["bio_summary"] = clean_bio
+                        if clean_bio and not f.get("source_sentence"):
+                            f["source_sentence"] = clean_bio
                         if li_url and not f.get("linkedin_url"):
                             f["linkedin_url"] = li_url
+                        if twitter_url and not f.get("twitter_url"):
+                            f["twitter_url"] = twitter_url
+                        if github_url and not f.get("github_url"):
+                            f["github_url"] = github_url
+                        if source and source not in f.get("sources", []):
+                            f.setdefault("sources", [f.get("source")] if f.get("source") else []).append(source)
                         if title and f.get("title") in ("Founder", "Key Personnel", "Team Member"):
                             f["title"] = clean_title
                 return
@@ -1290,20 +1459,38 @@ class CompanyMetadataScraper:
                     "url": li_url,
                     "icon": "💼",
                 })
+            if twitter_url:
+                source_refs.append({
+                    "name": "Twitter / X Profile",
+                    "url": twitter_url,
+                    "icon": "𝕏",
+                })
+            if github_url:
+                source_refs.append({
+                    "name": "GitHub Profile",
+                    "url": github_url,
+                    "icon": "🐙",
+                })
 
+            confidence = "HIGH" if ("JSON-LD" in source or "Team" in source or "LinkedIn" in source) else "MEDIUM"
             entry = {
                 "name": norm_name,
                 "title": clean_title,
                 "department": "Executive Leadership",
                 "linkedin_url": li_url,
+                "twitter_url": twitter_url,
+                "github_url": github_url,
                 "linkedin_search_url": li_url or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(norm_name + ' ' + company_name)}",
-                "avatar_url": photo,
-                "photo_url": photo,
-                "bio_summary": bio,
-                "bio": bio or f"Identified as {clean_title} of {company_name}",
+                "avatar_url": valid_photo,
+                "photo_url": valid_photo,
+                "bio_summary": clean_bio,
+                "bio": clean_bio or f"Identified as {clean_title} of {company_name}",
+                "source_sentence": clean_bio,
                 "biography": biography,
                 "source_references": source_refs,
                 "source": source,
+                "sources": [source],
+                "confidence": confidence,
                 "is_verified": True,
                 "is_founder": True,
             }
@@ -1743,18 +1930,18 @@ class PublicKnowledgeHarvester:
             "founded_year": "",
             "estimated_employees": "",
             "parent_organization": "",
+            "revenue": "",
+            "products": "",
+            "logo": None,
             "source_article": "",
             "source_url": "",
             "wikidata_id": "",
+            "wikidata_url": "",
+            "linkedin_id": "",
             "wikipedia_status": "not_listed",
             "searched_queries": queries[:6],
             "candidate_slugs": [],
         }
-
-        should_close = False
-        if not client:
-            client = httpx.AsyncClient(timeout=6.0, follow_redirects=True, headers=headers)
-            should_close = True
 
         try:
             candidate_titles: list[str] = []
@@ -1765,30 +1952,24 @@ class PublicKnowledgeHarvester:
 
             async def _wd_search(wq: str) -> list[str]:
                 matched_ids: list[str] = []
-                try:
-                    wd_url = f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={urllib.parse.quote(wq)}&language=en&limit=5&format=json"
-                    wd_r = await client.get(wd_url, headers=headers, timeout=3.5)
-                    if wd_r.status_code == 200:
-                        for wd_item in wd_r.json().get("search", []):
-                            wd_desc = (wd_item.get("description") or "").lower()
-                            wd_id = wd_item.get("id", "")
-                            if any(bad in wd_desc for bad in non_org_wd_words):
-                                continue
-                            if any(k in wd_desc for k in ["company", "corporation", "enterprise", "software", "platform", "organization", "firm", "cybersecurity", "financial", "provider", "business", "startup", "founded", "fintech", "technology"]):
-                                if wd_id:
-                                    matched_ids.append(wd_id)
-                except Exception:
-                    pass
+                wd_url = f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={urllib.parse.quote(wq)}&language=en&limit=5&format=json"
+                wd_r = await safe_osint_request("GET", wd_url, client=client, headers=headers, timeout=3.5, cache_ttl=1800.0)
+                if wd_r is not None and wd_r.status_code == 200:
+                    for wd_item in wd_r.json().get("search", []):
+                        wd_desc = (wd_item.get("description") or "").lower()
+                        wd_id = wd_item.get("id", "")
+                        if any(bad in wd_desc for bad in non_org_wd_words):
+                            continue
+                        if any(k in wd_desc for k in ["company", "corporation", "enterprise", "software", "platform", "organization", "firm", "cybersecurity", "financial", "provider", "business", "startup", "founded", "fintech", "technology"]):
+                            if wd_id:
+                                matched_ids.append(wd_id)
                 return matched_ids
 
             async def _wp_search(q_str: str) -> list[str]:
-                try:
-                    search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q_str)}&utf8=&format=json"
-                    r = await client.get(search_url, headers=headers, timeout=3.8)
-                    if r.status_code == 200:
-                        return [res.get("title") for res in r.json().get("query", {}).get("search", [])[:4] if res.get("title")]
-                except Exception:
-                    pass
+                search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q_str)}&utf8=&format=json"
+                r = await safe_osint_request("GET", search_url, client=client, headers=headers, timeout=3.8, cache_ttl=1800.0)
+                if r is not None and r.status_code == 200:
+                    return [res.get("title") for res in r.json().get("query", {}).get("search", [])[:4] if res.get("title")]
                 return []
 
             wd_coros = [_wd_search(wq) for wq in wd_queries]
@@ -1803,20 +1984,21 @@ class PublicKnowledgeHarvester:
                             wd_ids.append(wid)
             if wd_ids:
                 intel["wikidata_id"] = wd_ids[0]
-                try:
-                    ent_r = await client.get(
-                        f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={'|'.join(wd_ids[:3])}&props=sitelinks&sitefilter=enwiki&format=json",
-                        headers=headers,
-                        timeout=3.0,
-                    )
-                    if ent_r.status_code == 200:
-                        entities_map = ent_r.json().get("entities", {})
-                        for wid in wd_ids[:3]:
-                            en_title = entities_map.get(wid, {}).get("sitelinks", {}).get("enwiki", {}).get("title")
-                            if en_title and en_title not in candidate_titles:
-                                candidate_titles.append(en_title)
-                except Exception:
-                    pass
+                intel["wikidata_url"] = f"https://www.wikidata.org/wiki/{wd_ids[0]}"
+                ent_r = await safe_osint_request(
+                    "GET",
+                    f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={'|'.join(wd_ids[:3])}&props=sitelinks&sitefilter=enwiki&format=json",
+                    client=client,
+                    headers=headers,
+                    timeout=3.0,
+                    cache_ttl=1800.0,
+                )
+                if ent_r is not None and ent_r.status_code == 200:
+                    entities_map = ent_r.json().get("entities", {})
+                    for wid in wd_ids[:3]:
+                        en_title = entities_map.get(wid, {}).get("sitelinks", {}).get("enwiki", {}).get("title")
+                        if en_title and en_title not in candidate_titles:
+                            candidate_titles.append(en_title)
 
             for batch in combined_search[len(wd_coros):]:
                 if isinstance(batch, list):
@@ -1834,10 +2016,196 @@ class PublicKnowledgeHarvester:
                 headers=headers,
                 base_intel=intel,
             )
+            # 4. Structured Wikidata fallback (P112 founder, P169 CEO, P127 owned by, P856 website, P571 inception, P159 HQ, P1128 employees, P18 image, P6634 LinkedIn ID)
+            if wd_ids and (
+                matched_intel.get("wikipedia_status") != "found"
+                or not matched_intel.get("founders")
+                or not matched_intel.get("headquarters")
+                or not matched_intel.get("founded_year")
+                or not matched_intel.get("estimated_employees")
+                or not matched_intel.get("linkedin_id")
+            ):
+                wd_data = await cls.query_wikidata_fallback(
+                    company_name=company_name,
+                    domain=clean_domain,
+                    wikidata_id=wd_ids[0],
+                    client=client,
+                )
+                if wd_data:
+                    for fk in ("headquarters", "founded_year", "estimated_employees", "parent_organization", "logo", "linkedin_id", "wikidata_id", "wikidata_url"):
+                        if wd_data.get(fk) and not matched_intel.get(fk):
+                            matched_intel[fk] = wd_data[fk]
+                    if wd_data.get("linkedin_id") and wd_data["linkedin_id"] not in matched_intel.get("candidate_slugs", []):
+                        matched_intel.setdefault("candidate_slugs", []).append(wd_data["linkedin_id"])
+                    existing_f = {f.get("name", "").lower() for f in matched_intel.get("founders", [])}
+                    for wf in wd_data.get("founders", []):
+                        if wf.get("name", "").lower() not in existing_f:
+                            existing_f.add(wf["name"].lower())
+                            matched_intel.setdefault("founders", []).append(wf)
             return matched_intel
         finally:
-            if should_close:
-                await client.aclose()
+            pass
+
+    @classmethod
+    async def query_wikidata_fallback(
+        cls,
+        company_name: str,
+        domain: str,
+        wikidata_id: str = "",
+        client: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Structured Wikidata fallback extracting P112, P169, P127, P856, P571, P159, P1128, P18, P6634."""
+        clean_domain = domain.lower().replace("www.", "").strip()
+        domain_root = clean_domain.split(".")[0]
+        headers = {
+            "User-Agent": SAFE_USER_AGENT
+        }
+        out: dict[str, Any] = {
+            "wikidata_id": wikidata_id,
+            "wikidata_url": f"https://www.wikidata.org/wiki/{wikidata_id}" if wikidata_id else "",
+            "founders": [],
+            "parent_organization": "",
+            "founded_year": "",
+            "headquarters": "",
+            "estimated_employees": "",
+            "logo": None,
+            "linkedin_id": "",
+            "official_website": "",
+        }
+        if not wikidata_id:
+            wd_url = f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={urllib.parse.quote(company_name or domain_root)}&language=en&limit=3&format=json"
+            sr = await safe_osint_request("GET", wd_url, client=client, headers=headers, timeout=3.5, cache_ttl=1800.0)
+            if sr is not None and sr.status_code == 200:
+                for it in sr.json().get("search", []):
+                    desc = (it.get("description") or "").lower()
+                    if any(k in desc for k in ("company", "corporation", "software", "organization", "enterprise", "platform", "business")):
+                        wikidata_id = it.get("id", "")
+                        break
+        if not wikidata_id:
+            return {}
+        out["wikidata_id"] = wikidata_id
+        out["wikidata_url"] = f"https://www.wikidata.org/wiki/{wikidata_id}"
+
+        ent_url = f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={wikidata_id}&props=labels|claims|sitelinks&languages=en&format=json"
+        er = await safe_osint_request("GET", ent_url, client=client, headers=headers, timeout=4.0, cache_ttl=1800.0)
+        if er is None or er.status_code != 200:
+            return {}
+        entity = er.json().get("entities", {}).get(wikidata_id, {})
+        claims = entity.get("claims", {})
+        if not claims:
+            return {}
+
+        def _claim_vals(prop: str) -> list[Any]:
+            vals: list[Any] = []
+            for st in claims.get(prop, []):
+                dv = st.get("mainsnak", {}).get("datavalue", {})
+                if "value" in dv:
+                    vals.append(dv["value"])
+            return vals
+
+        # P856 official website verification
+        websites = [str(v).lower() for v in _claim_vals("P856") if isinstance(v, str)]
+        if websites:
+            out["official_website"] = websites[0]
+            if not any(clean_domain in w or (len(domain_root) >= 3 and domain_root in w) for w in websites):
+                lbl_en = (entity.get("labels", {}).get("en", {}).get("value") or "").lower()
+                if company_name.lower() not in lbl_en and domain_root not in lbl_en:
+                    return {}
+
+        # P571 inception
+        for tv in _claim_vals("P571"):
+            if isinstance(tv, dict) and tv.get("time"):
+                ym = re.search(r"(\d{4})", tv["time"])
+                if ym:
+                    out["founded_year"] = ym.group(1)
+                    break
+
+        # P1128 employees
+        for ev in _claim_vals("P1128"):
+            if isinstance(ev, dict) and ev.get("amount"):
+                num_str = str(ev["amount"]).lstrip("+")
+                out["estimated_employees"] = f"{num_str} employees"
+                break
+
+        # P6634 LinkedIn ID
+        for li in _claim_vals("P6634"):
+            if isinstance(li, str) and li.strip():
+                out["linkedin_id"] = li.strip().rstrip("/").split("/")[-1]
+                break
+
+        # P18 image
+        for img_name in _claim_vals("P18"):
+            if isinstance(img_name, str) and img_name.strip():
+                fn = urllib.parse.quote(img_name.strip().replace(" ", "_"))
+                out["logo"] = f"https://commons.wikimedia.org/wiki/Special:FilePath/{fn}?width=300"
+                break
+
+        # Collect Q-IDs for P112 (founder), P169 (CEO), P127 (owned by), P159 (HQ)
+        qids: list[str] = []
+        prop_qids: dict[str, list[str]] = {}
+        for p_code in ("P112", "P169", "P127", "P159"):
+            prop_qids[p_code] = []
+            for v in _claim_vals(p_code):
+                if isinstance(v, dict) and v.get("id"):
+                    qid = v["id"]
+                    prop_qids[p_code].append(qid)
+                    if qid not in qids:
+                        qids.append(qid)
+
+        label_map: dict[str, str] = {}
+        if qids:
+            lr = await safe_osint_request(
+                "GET",
+                f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={'|'.join(qids[:15])}&props=labels&languages=en&format=json",
+                client=client,
+                headers=headers,
+                timeout=3.5,
+                cache_ttl=1800.0,
+            )
+            if lr is not None and lr.status_code == 200:
+                for qid, qent in lr.json().get("entities", {}).items():
+                    lbl = qent.get("labels", {}).get("en", {}).get("value")
+                    if lbl:
+                        label_map[qid] = lbl
+
+        if prop_qids["P159"]:
+            out["headquarters"] = ", ".join(label_map[q] for q in prop_qids["P159"] if q in label_map)
+        if prop_qids["P127"]:
+            out["parent_organization"] = ", ".join(label_map[q] for q in prop_qids["P127"] if q in label_map)
+
+        seen_names: set[str] = set()
+        for qid in prop_qids["P112"]:
+            p_name = label_map.get(qid)
+            if p_name and p_name.lower() not in seen_names:
+                seen_names.add(p_name.lower())
+                out["founders"].append({
+                    "name": p_name,
+                    "title": "Founder",
+                    "department": "Executive Leadership",
+                    "linkedin_url": "",
+                    "source": f"Wikidata ({wikidata_id})",
+                    "sources": [f"Wikidata ({wikidata_id})"],
+                    "confidence": "HIGH",
+                    "is_founder": True,
+                    "is_verified": True,
+                })
+        for qid in prop_qids["P169"]:
+            p_name = label_map.get(qid)
+            if p_name and p_name.lower() not in seen_names:
+                seen_names.add(p_name.lower())
+                out["founders"].append({
+                    "name": p_name,
+                    "title": "CEO",
+                    "department": "Executive Leadership",
+                    "linkedin_url": "",
+                    "source": f"Wikidata ({wikidata_id})",
+                    "sources": [f"Wikidata ({wikidata_id})"],
+                    "confidence": "HIGH",
+                    "is_founder": True,
+                    "is_verified": True,
+                })
+
+        return out
 
     @classmethod
     async def inspect_wikipedia_titles(
@@ -1851,7 +2219,7 @@ class PublicKnowledgeHarvester:
         clean_domain = domain.lower().replace("www.", "").strip()
         domain_root = clean_domain.split(".")[0]
         headers = {
-            "User-Agent": "FootprintHub-OSINT/1.0 (contact@footprinthub.com; https://footprinthub.com) Mozilla/5.0"
+            "User-Agent": SAFE_USER_AGENT
         }
         base_intel: dict[str, Any] = {
             "founders": [],
@@ -1861,32 +2229,57 @@ class PublicKnowledgeHarvester:
             "founded_year": "",
             "estimated_employees": "",
             "parent_organization": "",
+            "revenue": "",
+            "products": "",
+            "logo": None,
             "source_article": "",
             "source_url": "",
             "wikidata_id": "",
+            "wikidata_url": "",
+            "linkedin_id": "",
             "wikipedia_status": "not_listed",
             "searched_queries": [],
             "candidate_slugs": [],
         }
         if not candidate_titles:
             return base_intel
-        should_close = False
-        if not client:
-            client = httpx.AsyncClient(timeout=5.0, follow_redirects=True, headers=headers)
-            should_close = True
+        return await cls._inspect_wikipedia_candidates(
+            candidate_titles=candidate_titles,
+            company_name=company_name,
+            clean_domain=clean_domain,
+            domain_root=domain_root,
+            client=client,
+            headers=headers,
+            base_intel=base_intel,
+        )
+
+    @classmethod
+    async def _fetch_commons_attribution(
+        cls, image_url: str, client: Optional[Any] = None
+    ) -> dict[str, str]:
+        """Fetch Wikimedia Commons license & author attribution via imageinfo API when applicable."""
+        if not image_url or "wikimedia.org" not in image_url.lower():
+            return {}
         try:
-            return await cls._inspect_wikipedia_candidates(
-                candidate_titles=candidate_titles,
-                company_name=company_name,
-                clean_domain=clean_domain,
-                domain_root=domain_root,
-                client=client,
-                headers=headers,
-                base_intel=base_intel,
+            fname = urllib.parse.unquote(image_url.split("/")[-1].split("?")[0])
+            # Thumbnail URLs often prefix e.g. 220px-Filename.jpg
+            fname = re.sub(r"^\d+px-", "", fname)
+            api_url = (
+                "https://commons.wikimedia.org/w/api.php?action=query"
+                f"&titles=File:{urllib.parse.quote(fname)}&prop=imageinfo&iiprop=extmetadata&format=json"
             )
-        finally:
-            if should_close:
-                await client.aclose()
+            r = await safe_osint_request("GET", api_url, client=client, timeout=3.0, cache_ttl=3600.0)
+            if r is not None and r.status_code == 200:
+                pages = r.json().get("query", {}).get("pages", {})
+                for p in pages.values():
+                    meta = (p.get("imageinfo") or [{}])[0].get("extmetadata", {})
+                    lic = meta.get("LicenseShortName", {}).get("value", "")
+                    artist = re.sub(r"<[^>]+>", "", meta.get("Artist", {}).get("value", "")).strip()
+                    if lic or artist:
+                        return {"license": lic, "attribution": artist[:120]}
+        except Exception:
+            pass
+        return {}
 
     @classmethod
     async def _inspect_wikipedia_candidates(
@@ -1909,13 +2302,10 @@ class PublicKnowledgeHarvester:
             return intel
 
         async def _fetch_parse(t: str) -> tuple[str, str]:
-            try:
-                parse_url = f"https://en.wikipedia.org/w/api.php?action=parse&page={urllib.parse.quote(t)}&prop=text&section=0&format=json"
-                p_resp = await client.get(parse_url, headers=headers, timeout=3.5)
-                if p_resp.status_code == 200:
-                    return (t, p_resp.json().get("parse", {}).get("text", {}).get("*", "") or "")
-            except Exception:
-                pass
+            parse_url = f"https://en.wikipedia.org/w/api.php?action=parse&page={urllib.parse.quote(t)}&prop=text&section=0&format=json"
+            p_resp = await safe_osint_request("GET", parse_url, client=client, headers=headers, timeout=3.5, cache_ttl=1800.0)
+            if p_resp is not None and p_resp.status_code == 200:
+                return (t, p_resp.json().get("parse", {}).get("text", {}).get("*", "") or "")
             return (t, "")
 
         parsed_articles = await asyncio.gather(*[_fetch_parse(t) for t in filtered_titles])
@@ -1949,6 +2339,8 @@ class PublicKnowledgeHarvester:
                 parsed_emp = ""
                 parsed_founded = ""
                 parsed_parent = ""
+                parsed_revenue = ""
+                parsed_products = ""
                 parsed_founders: list[dict[str, Any]] = []
                 parsed_slugs: list[str] = []
                 website_mismatch = False
@@ -1979,6 +2371,10 @@ class PublicKnowledgeHarvester:
                         parsed_industry = val
                     elif "headquarters" in lbl and not parsed_hq:
                         parsed_hq = val
+                    elif "revenue" in lbl and not parsed_revenue:
+                        parsed_revenue = val
+                    elif ("product" in lbl or "services" in lbl) and not parsed_products:
+                        parsed_products = val
                     elif "founded" in lbl and not parsed_founded:
                         ym = re.search(r"(19\d\d|20\d\d)", val)
                         if ym:
@@ -2015,10 +2411,12 @@ class PublicKnowledgeHarvester:
                                 if not any(stop in name.lower() for stop in ["university", "college", "software", "limited", "inc", "company", "corporation", "foundation", "institute"]):
                                     parsed_founders.append({
                                         "name": name,
-                                        "title": "Founder / Key Executive",
+                                        "title": "CEO" if ("ceo" in lbl and "founder" not in lbl) else "Founder / Key Executive",
                                         "department": "Executive Leadership",
                                         "linkedin_url": "",
                                         "source": f"Wikipedia / Open Knowledge ({title})",
+                                        "sources": [f"Wikipedia ({title})"],
+                                        "confidence": "HIGH",
                                         "is_founder": True,
                                         "is_verified": True,
                                     })
@@ -2044,6 +2442,8 @@ class PublicKnowledgeHarvester:
                     intel["estimated_employees"] = parsed_emp
                     intel["founded_year"] = parsed_founded
                     intel["parent_organization"] = parsed_parent
+                    intel["revenue"] = parsed_revenue
+                    intel["products"] = parsed_products
                     intel["founders"] = parsed_founders
                     intel["candidate_slugs"] = parsed_slugs
                     intel["source_article"] = title
@@ -2053,16 +2453,23 @@ class PublicKnowledgeHarvester:
                     if slug_from_title and slug_from_title not in intel["candidate_slugs"]:
                         intel["candidate_slugs"].append(slug_from_title)
 
-                    try:
-                        s_resp = await client.get(
-                            f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}",
-                            headers=headers,
-                            timeout=3.0,
-                        )
-                        if s_resp.status_code == 200:
-                            intel["description"] = s_resp.json().get("extract", "")
-                    except Exception:
-                        pass
+                    s_resp = await safe_osint_request(
+                        "GET",
+                        f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}",
+                        client=client,
+                        headers=headers,
+                        timeout=3.0,
+                        cache_ttl=1800.0,
+                    )
+                    if s_resp is not None and s_resp.status_code == 200:
+                        s_json = s_resp.json()
+                        intel["description"] = s_json.get("extract", "")
+                        w_logo = s_json.get("thumbnail", {}).get("source") or s_json.get("originalimage", {}).get("source")
+                        if w_logo and not intel.get("logo"):
+                            intel["logo"] = w_logo
+                        if s_json.get("wikibase_item"):
+                            intel["wikidata_id"] = s_json["wikibase_item"]
+                            intel["wikidata_url"] = f"https://www.wikidata.org/wiki/{s_json['wikibase_item']}"
 
                     if not intel["founders"] and intel["description"]:
                         lead_m = re.search(
@@ -2124,205 +2531,197 @@ class PublicKnowledgeHarvester:
         domain_root = clean_domain.split(".")[0]
         comp_low = (company_name or domain_root).lower().strip()
 
+        active_provider = SearchProvider.get_provider()
         out: dict[str, Any] = {
             "founders": [],
+            "employees": [],
             "social_profiles": [],
             "wikipedia_titles": [],
             "linkedin_company_url": "",
             "search_snippets": [],
+            "search_provider": active_provider.name,
+            "provider_configured": active_provider.is_configured,
         }
 
         queries = [
             f"{company_name} founder CEO",
-            f'"{clean_domain}" OR "{company_name}" site:linkedin.com/company OR site:en.wikipedia.org',
+            f'site:linkedin.com/in "{company_name}" "Founder OR CEO OR Engineer"',
+            f'site:linkedin.com/company "{company_name}"',
+            f'"{clean_domain}" OR "{company_name}" site:en.wikipedia.org',
         ]
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": SAFE_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
         }
-        should_close = False
-        if not client:
-            client = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
-            should_close = True
-
-        def _unwrap_yahoo_url(href: str) -> str:
-            m_ru = re.search(r"/RU=([^/]+)/", href or "")
-            if m_ru:
-                try:
-                    return urllib.parse.unquote(m_ru.group(1))
-                except Exception:
-                    pass
-            return href or ""
 
         def _norm_role(raw_r: str) -> str:
             cleaned = re.sub(r"\bco-\s+", "Co-", raw_r, flags=re.I)
             cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-|")
             return re.sub(r"\b(Ceo|Cto|Coo|Cfo|Ciso|Vp)\b", lambda m: m.group(1).upper(), cleaned.title())
 
-        def _strip_yahoo_title(raw_t: str) -> str:
-            # Yahoo anchor text often prepends breadcrumb: "LinkedIn https://www.linkedin.com › in › slug Name - Title"
+        def _strip_title_prefix(raw_t: str) -> str:
             cleaned = re.sub(r"^(?:[A-Za-z0-9._-]+\s+)?https?://[^\s]+(?:\s+›\s+[^\s]+)*\s+", "", raw_t or "").strip()
             cleaned = re.sub(r"\s*[|•]\s*(?:LinkedIn|Crunchbase|Forbes.*|RocketReach).*$", "", cleaned, flags=re.I)
             cleaned = re.sub(r"\([^)]*\)", "", cleaned).strip()
             return cleaned
 
         seen_founder_names: set[str] = set()
+        seen_emp_names: set[str] = set()
         seen_soc_keys: set[str] = set()
 
-        async def _query_yahoo(q_str: str) -> str:
-            try:
-                resp = await client.get(
-                    f"https://search.yahoo.com/search?p={urllib.parse.quote(q_str)}",
-                    headers=headers,
-                    timeout=5.5,
-                )
-                if resp.status_code == 200 and resp.text:
-                    return resp.text
-            except Exception:
-                pass
-            return ""
-
-        async def _query_google_news(q_str: str) -> str:
-            try:
-                resp = await client.get(
-                    f"https://news.google.com/rss/search?q={urllib.parse.quote(q_str)}&hl=en-US&gl=US&ceid=US:en",
-                    headers=headers,
-                    timeout=5.5,
-                )
-                if resp.status_code == 200 and resp.text:
-                    return resp.text
-            except Exception:
-                pass
-            return ""
-
         try:
-            yahoo_pages, gnews_xml = await asyncio.gather(
-                asyncio.gather(*[_query_yahoo(q) for q in queries]),
-                _query_google_news(f'"{company_name}" founder OR CEO'),
+            search_hits, gnews_resp = await asyncio.gather(
+                active_provider.search_many(queries[:3] if active_provider.is_configured else queries[:2], client=client),
+                safe_osint_request(
+                    "GET",
+                    f"https://news.google.com/rss/search?q={urllib.parse.quote(f'\"{company_name}\" founder OR CEO')}&hl=en-US&gl=US&ceid=US:en",
+                    client=client,
+                    headers=headers,
+                    timeout=5.5,
+                    cache_ttl=900.0,
+                ),
             )
-            for html_body in yahoo_pages:
-                if not html_body:
+            gnews_xml = gnews_resp.text if gnews_resp is not None and getattr(gnews_resp, "status_code", 0) == 200 else ""
+            logger.info("SearchProvider(%s) returned %d hits for %s", active_provider.name, len(search_hits), clean_domain)
+
+            for hit in search_hits:
+                dest_url = hit.get("url", "")
+                raw_title = hit.get("title", "")
+                snippet = hit.get("snippet", "")
+                combined_low = f"{raw_title} {snippet} {dest_url}".lower()
+
+                is_relevant = (
+                    clean_domain in combined_low
+                    or (len(comp_low) >= 4 and comp_low in combined_low)
+                    or (len(domain_root) >= 4 and domain_root in combined_low)
+                )
+                if not is_relevant:
+                    logger.debug("Rejected search hit (no company/domain affiliation): %s", dest_url)
                     continue
-                soup = BeautifulSoup(html_body, "html.parser")
-                for algo in soup.select("div.algo")[:8]:
-                    a_tag = algo.select_one("h3 a, a")
-                    if not a_tag:
+
+                if snippet and len(out["search_snippets"]) < 6:
+                    out["search_snippets"].append({"title": raw_title, "url": dest_url, "snippet": snippet[:280]})
+
+                # 1. Discover official LinkedIn company URL or social channels
+                for soc in SocialMediaScraper.extract_social_links(dest_url):
+                    if soc.get("type") == "personal":
                         continue
-                    dest_url = _unwrap_yahoo_url(a_tag.get("href", ""))
-                    raw_title = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
-                    snip_el = algo.select_one("div.compText, p")
-                    snippet = re.sub(r"\s+", " ", snip_el.get_text(" ", strip=True)).strip() if snip_el else ""
+                    handle_low = soc.get("handle", "").lower()
+                    if (len(domain_root) >= 3 and domain_root in handle_low) or (len(comp_low) >= 4 and comp_low.replace(" ", "") in handle_low.replace("-", "")):
+                        dk = f"{soc['platform']}:{handle_low}"
+                        if dk not in seen_soc_keys:
+                            seen_soc_keys.add(dk)
+                            soc["found_on_website"] = False
+                            soc["source"] = f"Online OSINT Search ({active_provider.name})"
+                            out["social_profiles"].append(soc)
+                            if soc["platform"] == "LinkedIn" and soc.get("type") == "company" and not out["linkedin_company_url"]:
+                                out["linkedin_company_url"] = soc["url"]
 
-                    combined_low = f"{raw_title} {snippet} {dest_url}".lower()
-                    # Verify strong relevance to the target company/domain
-                    is_relevant = (
-                        clean_domain in combined_low
-                        or (len(comp_low) >= 4 and comp_low in combined_low)
-                        or (len(domain_root) >= 4 and domain_root in combined_low)
-                    )
-                    if not is_relevant:
-                        continue
+                # 2. Discover Wikipedia pages for company or founder
+                if "en.wikipedia.org/wiki/" in dest_url.lower():
+                    wiki_t = urllib.parse.unquote(dest_url.split("/wiki/")[-1].split("#")[0].split("?")[0]).replace("_", " ")
+                    if wiki_t and wiki_t not in out["wikipedia_titles"]:
+                        out["wikipedia_titles"].append(wiki_t)
 
-                    if snippet and len(out["search_snippets"]) < 6:
-                        out["search_snippets"].append({"title": raw_title, "url": dest_url, "snippet": snippet[:280]})
+                # 3. Extract founder/CEO or employee from LinkedIn /in/ & verified profile results
+                is_exec_profile_site = any(
+                    host_tok in dest_url.lower()
+                    for host_tok in ("linkedin.com/in/", "crunchbase.com/person/", "forbes.com/", "rocketreach.co/", "tracxn.com/")
+                )
+                if is_exec_profile_site:
+                    clean_t = _strip_title_prefix(raw_title)
+                    parts = [p.strip() for p in re.split(r"\s+(?:[-–—|]|,)\s+", clean_t) if p.strip()]
+                    cand_name = parts[0] if parts else ""
+                    cand_role_text = " ".join(parts[1:]) if len(parts) > 1 else ""
 
-                    # 1. Discover official LinkedIn company URL or social channels
-                    for soc in SocialMediaScraper.extract_social_links(dest_url):
-                        if soc.get("type") == "personal":
+                    n_words = cand_name.split()
+                    if 2 <= len(n_words) <= 4 and all(re.match(r"^[A-Z][a-zA-Z.'-]*$", w) for w in n_words):
+                        tied_to_target = (
+                            comp_low in f"{raw_title} {snippet}".lower()
+                            or domain_root in f"{raw_title} {snippet}".lower()
+                        )
+                        text_after_role = f"{cand_role_text}".lower()
+                        affiliation_ok = tied_to_target and (
+                            not text_after_role or comp_low in text_after_role or domain_root in text_after_role or "at " not in text_after_role
+                        )
+                        if not affiliation_ok:
+                            logger.debug("Rejected LinkedIn/profile candidate %s (missing affiliation)", cand_name)
                             continue
-                        handle_low = soc.get("handle", "").lower()
-                        if (len(domain_root) >= 3 and domain_root in handle_low) or (len(comp_low) >= 4 and comp_low.replace(" ", "") in handle_low.replace("-", "")):
-                            dk = f"{soc['platform']}:{handle_low}"
-                            if dk not in seen_soc_keys:
-                                seen_soc_keys.add(dk)
-                                soc["found_on_website"] = False
-                                soc["source"] = "Online OSINT Search"
-                                out["social_profiles"].append(soc)
-                                if soc["platform"] == "LinkedIn" and soc.get("type") == "company" and not out["linkedin_company_url"]:
-                                    out["linkedin_company_url"] = soc["url"]
 
-                    # 2. Discover Wikipedia pages for company or founder
-                    if "en.wikipedia.org/wiki/" in dest_url.lower():
-                        wiki_t = urllib.parse.unquote(dest_url.split("/wiki/")[-1].split("#")[0].split("?")[0]).replace("_", " ")
-                        if wiki_t and wiki_t not in out["wikipedia_titles"]:
-                            out["wikipedia_titles"].append(wiki_t)
-
-                    # 3. Extract founder/CEO from LinkedIn /in/ or verified executive profile search results
-                    is_exec_profile_site = any(
-                        host_tok in dest_url.lower()
-                        for host_tok in ("linkedin.com/in/", "crunchbase.com/person/", "forbes.com/", "rocketreach.co/", "tracxn.com/")
-                    )
-                    if is_exec_profile_site:
-                        clean_t = _strip_yahoo_title(raw_title)
-                        parts = [p.strip() for p in re.split(r"\s+(?:[-–—|]|,)\s+", clean_t) if p.strip()]
-                        cand_name = parts[0] if parts else ""
-                        cand_role_text = " ".join(parts[1:]) if len(parts) > 1 else ""
-
-                        # Validate person name (2-4 words, capitalized)
-                        n_words = cand_name.split()
-                        if 2 <= len(n_words) <= 4 and all(re.match(r"^[A-Z][a-zA-Z.'-]*$", w) for w in n_words):
-                            # Confirm executive role appears in title or snippet alongside company
-                            role_m = re.search(
-                                r"\b((?:Co-?\s*)?Founder(?:\s*(?:&|and|,)\s*(?:CEO|CTO|COO|President|Managing Director))?|Chief Executive Officer|CEO(?:\s*(?:&|and|,)\s*(?:Co-?\s*)?Founder)?|Managing Director|President)\b",
-                                f"{cand_role_text} {snippet}",
-                                re.I,
-                            )
-                            if role_m:
-                                # Ensure they aren't explicitly listed as founder of a *different* company
-                                text_after_role = f"{cand_role_text}".lower()
-                                tied_to_target = (
-                                    comp_low in f"{raw_title} {snippet}".lower()
-                                    or domain_root in f"{raw_title} {snippet}".lower()
+                        role_m = re.search(
+                            r"\b((?:Co-?\s*)?Founder(?:\s*(?:&|and|,)\s*(?:CEO|CTO|COO|President|Managing Director))?|Chief Executive Officer|CEO(?:\s*(?:&|and|,)\s*(?:Co-?\s*)?Founder)?|CTO|COO|CFO|CISO|Managing Director|President|VP\s+[A-Za-z &]{2,25}|(?:Senior\s+|Lead\s+|Principal\s+)?(?:Software|Security|DevOps|Cloud|Product)?\s*(?:Engineer|Developer|Architect|Manager|Director|Analyst))\b",
+                            f"{cand_role_text} {snippet}",
+                            re.I,
+                        )
+                        li_profile_url = dest_url if "linkedin.com/in/" in dest_url.lower() else ""
+                        is_leader_role = bool(
+                            role_m and re.search(r"(founder|ceo|chief executive|cto|coo|cfo|managing director|president)", role_m.group(0), re.I)
+                        )
+                        role_clean = _norm_role(role_m.group(0)) if role_m else (_norm_role(cand_role_text) if cand_role_text and len(cand_role_text) <= 45 else "Staff / Professional")
+                        conf = "HIGH" if (li_profile_url and (comp_low in text_after_role or domain_root in text_after_role)) else "MEDIUM"
+                        src_label = f"Online Search ({active_provider.name})"
+                        person_obj = {
+                            "name": cand_name,
+                            "title": role_clean,
+                            "department": "Executive Leadership" if is_leader_role else (
+                                "Cybersecurity & IT" if any(w in role_clean.lower() for w in ("security", "ciso", "soc", "analyst")) else (
+                                    "Engineering & Tech" if any(w in role_clean.lower() for w in ("engineer", "developer", "architect", "devops", "cto", "tech")) else "Operations & Business"
                                 )
-                                li_profile_url = dest_url if "linkedin.com/in/" in dest_url.lower() else ""
-                                if tied_to_target and (not text_after_role or comp_low in text_after_role or domain_root in text_after_role or "at " not in text_after_role):
-                                    nk = cand_name.lower()
-                                    if nk not in seen_founder_names:
-                                        seen_founder_names.add(nk)
-                                        role_clean = _norm_role(role_m.group(0))
-                                        out["founders"].append({
-                                            "name": cand_name,
-                                            "title": role_clean,
-                                            "department": "Executive Leadership",
-                                            "linkedin_url": li_profile_url,
-                                            "linkedin_search_url": li_profile_url or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(cand_name + ' ' + company_name)}",
-                                            "bio": snippet or f"{role_clean} at {company_name}",
-                                            "source": "Online OSINT Search (LinkedIn / Web Index)" if li_profile_url else "Online OSINT Search (Web Index)",
-                                            "source_references": [
-                                                {"name": f"{company_name} official website", "url": f"https://{clean_domain}", "icon": "🌐"},
-                                                {"name": "LinkedIn Profile" if li_profile_url else raw_title[:50], "url": dest_url, "icon": "💼" if li_profile_url else "🔍"},
-                                            ],
-                                            "is_verified": True,
-                                            "is_founder": True,
-                                        })
+                            ),
+                            "linkedin_url": li_profile_url,
+                            "linkedin_search_url": li_profile_url or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(cand_name + ' ' + company_name)}",
+                            "bio": snippet or f"{role_clean} at {company_name}",
+                            "source_sentence": snippet or raw_title,
+                            "source": src_label,
+                            "sources": [src_label],
+                            "confidence": conf,
+                            "source_references": [
+                                {"name": f"{company_name} official website", "url": f"https://{clean_domain}", "icon": "🌐"},
+                                {"name": "LinkedIn Profile" if li_profile_url else raw_title[:50], "url": dest_url, "icon": "💼" if li_profile_url else "🔍"},
+                            ],
+                            "is_verified": True,
+                            "is_founder": is_leader_role,
+                        }
+                        nk = cand_name.lower()
+                        if is_leader_role:
+                            if nk not in seen_founder_names:
+                                seen_founder_names.add(nk)
+                                out["founders"].append(person_obj)
+                        elif li_profile_url:
+                            if nk not in seen_emp_names and nk not in seen_founder_names:
+                                seen_emp_names.add(nk)
+                                out["employees"].append(person_obj)
 
-                    # 4. Extract founder/CEO from Wikipedia or Crunchbase snippet text
-                    for fm in re.finditer(
-                        r"(?:founded|co-founded)\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-zA-Z.'-]*){1,3})(?:\s+(?:and|&)\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-zA-Z.'-]*){1,3}))?",
-                        f"{raw_title} {snippet}",
-                    ):
-                        for grp_idx, grp_role in [(1, "Founder"), (2, "Co-Founder")]:
-                            fn = fm.group(grp_idx)
-                            if fn and not any(bad in fn.lower() for bad in ["the ", "our ", "its ", "company", "group"]):
-                                nk = fn.lower().strip()
-                                if nk not in seen_founder_names:
-                                    seen_founder_names.add(nk)
-                                    out["founders"].append({
-                                        "name": fn.strip(),
-                                        "title": grp_role,
-                                        "department": "Executive Leadership",
-                                        "linkedin_url": "",
-                                        "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(fn.strip() + ' ' + company_name)}",
-                                        "bio": snippet or f"{grp_role} of {company_name}",
-                                        "source": "Online OSINT Search (Web Index)",
-                                        "source_references": [
-                                            {"name": raw_title[:60], "url": dest_url, "icon": "🌐"},
-                                        ],
-                                        "is_verified": True,
-                                        "is_founder": True,
-                                    })
+                # 4. Extract founder/CEO from snippet narrative
+                for fm in re.finditer(
+                    r"(?:founded|co-founded)\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-zA-Z.'-]*){1,3})(?:\s+(?:and|&)\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-zA-Z.'-]*){1,3}))?",
+                    f"{raw_title} {snippet}",
+                ):
+                    for grp_idx, grp_role in [(1, "Founder"), (2, "Co-Founder")]:
+                        fn = fm.group(grp_idx)
+                        if fn and not any(bad in fn.lower() for bad in ["the ", "our ", "its ", "company", "group"]):
+                            nk = fn.lower().strip()
+                            if nk not in seen_founder_names:
+                                seen_founder_names.add(nk)
+                                out["founders"].append({
+                                    "name": fn.strip(),
+                                    "title": grp_role,
+                                    "department": "Executive Leadership",
+                                    "linkedin_url": "",
+                                    "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(fn.strip() + ' ' + company_name)}",
+                                    "bio": snippet or f"{grp_role} of {company_name}",
+                                    "source_sentence": fm.group(0),
+                                    "source": f"Online Search ({active_provider.name})",
+                                    "sources": [f"Online Search ({active_provider.name})"],
+                                    "confidence": "MEDIUM",
+                                    "source_references": [
+                                        {"name": raw_title[:60], "url": dest_url, "icon": "🌐"},
+                                    ],
+                                    "is_verified": True,
+                                    "is_founder": True,
+                                })
 
-            # 5. Parse Google News RSS items for press/news founder mentions (works reliably even if web search limits)
+            # 5. Parse Google News RSS items for press/news founder mentions
             if gnews_xml and "<item>" in gnews_xml:
                 import xml.etree.ElementTree as ET
                 root_el = ET.fromstring(gnews_xml)
@@ -2360,7 +2759,10 @@ class PublicKnowledgeHarvester:
                                 "linkedin_url": "",
                                 "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(g_name + ' ' + company_name)}",
                                 "bio": item_desc[:260] or item_title,
-                                "source": "Online News & Press Search",
+                                "source_sentence": gm.group(0),
+                                "source": "Google News RSS",
+                                "sources": ["Google News RSS"],
+                                "confidence": "MEDIUM",
                                 "source_references": [{"name": item_title[:60], "url": item_url, "icon": "📰"}],
                                 "is_verified": True,
                                 "is_founder": True,
@@ -2381,16 +2783,16 @@ class PublicKnowledgeHarvester:
                                     "linkedin_url": "",
                                     "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(g_name + ' ' + company_name)}",
                                     "bio": item_desc[:260] or item_title,
-                                    "source": "Online News & Press Search",
+                                    "source_sentence": gm2.group(0),
+                                    "source": "Google News RSS",
+                                    "sources": ["Google News RSS"],
+                                    "confidence": "MEDIUM",
                                     "source_references": [{"name": item_title[:60], "url": item_url, "icon": "📰"}],
                                     "is_verified": True,
                                     "is_founder": True,
                                 })
-        except Exception:
-            pass
-        finally:
-            if should_close:
-                await client.aclose()
+        except Exception as exc:
+            logger.debug("dig_online_intelligence error for %s: %s", clean_domain, exc)
 
         return out
 
@@ -2402,17 +2804,13 @@ class PublicKnowledgeHarvester:
         q = f"{name} {company_name}".strip()
         url = f"https://www.bing.com/images/search?q={urllib.parse.quote(q)}&form=HDRSC2&first=1"
         b_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 FootprintHub/1.0",
+            "User-Agent": SAFE_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        should_close = False
-        if not client:
-            client = httpx.AsyncClient(timeout=6.0, follow_redirects=True)
-            should_close = True
         try:
-            resp = await client.get(url, headers=b_headers, timeout=6.0)
-            if resp.status_code == 200:
+            resp = await safe_osint_request("GET", url, client=client, headers=b_headers, timeout=6.0, cache_ttl=1800.0)
+            if resp is not None and resp.status_code == 200:
                 murls = re.findall(r'murl&quot;:&quot;(https?://[^&]+)&quot;', resp.text)
                 if not murls:
                     murls = re.findall(r'"murl":"(https?://[^"]+)"', resp.text)
@@ -2424,9 +2822,6 @@ class PublicKnowledgeHarvester:
                     return murls[0].replace("\\/", "/")
         except Exception:
             pass
-        finally:
-            if should_close:
-                await client.aclose()
         return None
 
     @classmethod
@@ -2439,15 +2834,16 @@ class PublicKnowledgeHarvester:
     ) -> dict[str, Any]:
         """
         Enriches an individual founder or executive with verified Wikipedia biographical details,
-        authoritative person photo, career milestones, and verified source references.
+        authoritative person photo (with Wikimedia Commons attribution), career milestones, and references.
         Only attaches Wikipedia profiles that demonstrably match the person AND company context.
         """
         headers = {
-            "User-Agent": "FootprintHub-OSINT/1.0 (https://footprinthub.com; security@footprinthub.com) Mozilla/5.0"
+            "User-Agent": SAFE_USER_AGENT
         }
         profile: dict[str, Any] = {
             "photo_url": None,
             "avatar_url": None,
+            "photo_attribution": {},
             "bio_summary": "",
             "bio": "",
             "wikipedia_url": "",
@@ -2455,11 +2851,6 @@ class PublicKnowledgeHarvester:
             "source_references": [],
             "current_role": "",
         }
-
-        should_close = False
-        if not client:
-            client = httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=headers)
-            should_close = True
 
         try:
             if domain:
@@ -2476,8 +2867,8 @@ class PublicKnowledgeHarvester:
 
             for search_q in [f'"{name}" "{company_name}"', name]:
                 search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(search_q)}&utf8=&format=json"
-                r = await client.get(search_url, headers=headers, timeout=6.0)
-                if r.status_code != 200:
+                r = await safe_osint_request("GET", search_url, client=client, headers=headers, timeout=6.0, cache_ttl=1800.0)
+                if r is None or r.status_code != 200:
                     continue
                 results = r.json().get("query", {}).get("search", [])
                 for res in results[:3]:
@@ -2499,9 +2890,9 @@ class PublicKnowledgeHarvester:
             if matched_title:
                 # 2. Query summary and double-check company relation before accepting
                 s_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(matched_title)}"
-                s_resp = await client.get(s_url, headers=headers, timeout=6.0)
+                s_resp = await safe_osint_request("GET", s_url, client=client, headers=headers, timeout=6.0, cache_ttl=1800.0)
                 s_extract = ""
-                if s_resp.status_code == 200:
+                if s_resp is not None and s_resp.status_code == 200:
                     s_data = s_resp.json()
                     s_extract = s_data.get("extract", "")
                     s_low = s_extract.lower()
@@ -2513,14 +2904,17 @@ class PublicKnowledgeHarvester:
                         if thumb:
                             profile["photo_url"] = thumb
                             profile["avatar_url"] = thumb
+                            attr = await cls._fetch_commons_attribution(thumb, client=client)
+                            if attr:
+                                profile["photo_attribution"] = attr
                     else:
                         matched_title = ""
 
             if matched_title:
                 # 3. Parse infobox for biography table & institutional source references
                 p_url = f"https://en.wikipedia.org/w/api.php?action=parse&page={urllib.parse.quote(matched_title)}&prop=text&section=0&format=json"
-                p_resp = await client.get(p_url, headers=headers, timeout=6.0)
-                if p_resp.status_code == 200:
+                p_resp = await safe_osint_request("GET", p_url, client=client, headers=headers, timeout=6.0, cache_ttl=1800.0)
+                if p_resp is not None and p_resp.status_code == 200:
                     html_text = p_resp.json().get("parse", {}).get("text", {}).get("*", "")
                     if html_text:
                         soup = BeautifulSoup(html_text, "html.parser")
@@ -2591,11 +2985,234 @@ class PublicKnowledgeHarvester:
 
         except Exception:
             pass
-        finally:
-            if should_close:
-                await client.aclose()
 
         return profile
+
+
+class SearchProvider:
+    """Pluggable SearchProvider interface for OSINT web & LinkedIn search discovery."""
+
+    name: str = "base"
+    is_configured: bool = False
+
+    async def search(self, query: str, client: Optional[Any] = None) -> list[dict[str, str]]:
+        return []
+
+    async def search_many(self, queries: list[str], client: Optional[Any] = None) -> list[dict[str, str]]:
+        batches = await asyncio.gather(*[self.search(q, client=client) for q in queries], return_exceptions=True)
+        out: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for batch in batches:
+            if isinstance(batch, list):
+                for hit in batch:
+                    u = (hit.get("url") or "").strip()
+                    if u and u not in seen_urls:
+                        seen_urls.add(u)
+                        out.append(hit)
+        return out
+
+    @classmethod
+    def get_provider(cls) -> "SearchProvider":
+        pref = (getattr(settings, "SEARCH_PROVIDER", "auto") or "auto").strip().lower()
+        brave_key = getattr(settings, "BRAVE_API_KEY", None)
+        serp_key = getattr(settings, "SERPAPI_KEY", None)
+        bing_key = getattr(settings, "BING_SEARCH_API_KEY", None)
+
+        if pref == "brave" or (pref == "auto" and brave_key):
+            if brave_key:
+                return BraveSearchProvider(brave_key)
+        if pref == "serpapi" or (pref == "auto" and serp_key):
+            if serp_key:
+                return SerpAPISearchProvider(serp_key)
+        if pref == "bing" or (pref == "auto" and bing_key):
+            if bing_key:
+                return BingSearchProvider(bing_key)
+        return PublicFallbackSearchProvider()
+
+
+class BraveSearchProvider(SearchProvider):
+    """Brave Web Search API provider."""
+
+    name = "Brave Search API"
+    is_configured = True
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    async def search(self, query: str, client: Optional[Any] = None) -> list[dict[str, str]]:
+        resp = await safe_osint_request(
+            "GET",
+            "https://api.search.brave.com/res/v1/web/search",
+            client=client,
+            headers={"X-Subscription-Token": self.api_key, "Accept": "application/json"},
+            params={"q": query, "count": 10},
+            timeout=6.0,
+            cache_ttl=900.0,
+        )
+        if resp is None or resp.status_code != 200:
+            return []
+        hits: list[dict[str, str]] = []
+        for item in resp.json().get("web", {}).get("results", []):
+            hits.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("description", ""),
+            })
+        return hits
+
+
+class SerpAPISearchProvider(SearchProvider):
+    """SerpAPI Google organic search provider."""
+
+    name = "SerpAPI"
+    is_configured = True
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    async def search(self, query: str, client: Optional[Any] = None) -> list[dict[str, str]]:
+        resp = await safe_osint_request(
+            "GET",
+            "https://serpapi.com/search.json",
+            client=client,
+            params={"q": query, "api_key": self.api_key, "num": 10},
+            timeout=6.0,
+            cache_ttl=900.0,
+        )
+        if resp is None or resp.status_code != 200:
+            return []
+        hits: list[dict[str, str]] = []
+        for item in resp.json().get("organic_results", []):
+            hits.append({
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            })
+        return hits
+
+
+class BingSearchProvider(SearchProvider):
+    """Microsoft Bing Web Search v7 API provider."""
+
+    name = "Bing Search API"
+    is_configured = True
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+
+    async def search(self, query: str, client: Optional[Any] = None) -> list[dict[str, str]]:
+        resp = await safe_osint_request(
+            "GET",
+            "https://api.bing.microsoft.com/v7.0/search",
+            client=client,
+            headers={"Ocp-Apim-Subscription-Key": self.api_key},
+            params={"q": query, "count": 10},
+            timeout=6.0,
+            cache_ttl=900.0,
+        )
+        if resp is None or resp.status_code != 200:
+            return []
+        hits: list[dict[str, str]] = []
+        for item in resp.json().get("webPages", {}).get("value", []):
+            hits.append({
+                "title": item.get("name", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("snippet", ""),
+            })
+        return hits
+
+
+class PublicFallbackSearchProvider(SearchProvider):
+    """Unauthenticated Yahoo public search fallback (Google News RSS runs alongside)."""
+
+    name = "Public Web Fallback (Yahoo / News)"
+    is_configured = False
+
+    @staticmethod
+    def _unwrap_yahoo_url(href: str) -> str:
+        m_ru = re.search(r"/RU=([^/]+)/", href or "")
+        if m_ru:
+            try:
+                return urllib.parse.unquote(m_ru.group(1))
+            except Exception:
+                pass
+        return href or ""
+
+    async def search(self, query: str, client: Optional[Any] = None) -> list[dict[str, str]]:
+        resp = await safe_osint_request(
+            "GET",
+            f"https://search.yahoo.com/search?p={urllib.parse.quote(query)}",
+            client=client,
+            headers={"Accept-Language": "en-US,en;q=0.9"},
+            timeout=5.5,
+            cache_ttl=900.0,
+        )
+        if resp is None or getattr(resp, "status_code", 0) != 200 or not getattr(resp, "text", ""):
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        hits: list[dict[str, str]] = []
+        for algo in soup.select("div.algo")[:8]:
+            a_tag = algo.select_one("h3 a, a")
+            if not a_tag:
+                continue
+            dest_url = self._unwrap_yahoo_url(a_tag.get("href", ""))
+            raw_title = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
+            snip_el = algo.select_one("div.compText, p")
+            snippet = re.sub(r"\s+", " ", snip_el.get_text(" ", strip=True)).strip() if snip_el else ""
+            if dest_url:
+                hits.append({"title": raw_title, "url": dest_url, "snippet": snippet})
+        return hits
+
+
+class OptionalPeopleDataProvider:
+    """Optional licensed people-data API hook (skipped silently unless PEOPLE_DATA_API_KEY + URL set)."""
+
+    @classmethod
+    async def lookup_company_people(
+        cls,
+        domain: str,
+        company_name: str,
+        client: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
+        api_key = getattr(settings, "PEOPLE_DATA_API_KEY", None)
+        api_url = getattr(settings, "PEOPLE_DATA_API_URL", None)
+        if not api_key or not api_url:
+            return []
+        resp = await safe_osint_request(
+            "GET",
+            api_url,
+            client=client,
+            headers={"X-Api-Key": api_key, "Accept": "application/json"},
+            params={"domain": domain, "company": company_name, "limit": 20},
+            timeout=6.0,
+            cache_ttl=1800.0,
+        )
+        if resp is None or resp.status_code != 200:
+            return []
+        results: list[dict[str, Any]] = []
+        try:
+            payload = resp.json()
+            raw_rows = payload.get("data") or payload.get("employees") or payload.get("results") or []
+            for row in raw_rows:
+                name = (row.get("full_name") or row.get("name") or "").strip()
+                if not name or len(name.split()) < 2:
+                    continue
+                results.append({
+                    "name": name,
+                    "title": row.get("job_title") or row.get("title") or "Team Member",
+                    "department": row.get("department") or "Operations & Business",
+                    "linkedin_url": row.get("linkedin_url") or "",
+                    "email": row.get("work_email") or row.get("email") or "",
+                    "location": row.get("location") or "",
+                    "avatar_url": validate_image_url(row.get("photo_url") or row.get("avatar_url"), domain),
+                    "source": "Licensed People Data API",
+                    "sources": ["Licensed People Data API"],
+                    "confidence": "HIGH",
+                    "is_verified": True,
+                })
+        except Exception:
+            pass
+        return results
 
 
 class LinkedInOSINTEngine:
@@ -2650,6 +3267,15 @@ class LinkedInOSINTEngine:
             fol_m = re.search(r"([0-9,]+)\s+followers", html_text, re.I)
             if fol_m:
                 meta_info["followers"] = fol_m.group(1)
+
+        if not meta_info["estimated_employees"]:
+            emp_m = re.search(
+                r"(?:View all\s+)?([0-9,]+(?:\s*[-–]\s*[0-9,]+|\+)?)\s+employees\b",
+                f"{meta_info.get('description', '')} {soup.get_text(' ', strip=True)[:8000]}",
+                re.I,
+            )
+            if emp_m:
+                meta_info["estimated_employees"] = f"{emp_m.group(1).strip()} employees"
 
         # Parse JSON-LD for Organization
         for script in soup.find_all("script", type="application/ld+json"):
@@ -2774,6 +3400,62 @@ class LinkedInOSINTEngine:
         return meta_info, employees
 
     @classmethod
+    async def fetch_public_profile_og(
+        cls,
+        linkedin_url: str,
+        company_name: str,
+        domain: str,
+        client: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Passively fetch public og:title / og:description / og:image from a LinkedIn /in/ URL
+        only when served publicly without login/authwall. Never bypasses protections.
+        """
+        if not linkedin_url or "linkedin.com/in/" not in linkedin_url.lower():
+            return None
+        resp = await safe_osint_request(
+            "GET",
+            linkedin_url,
+            client=client,
+            headers={"Accept-Language": "en-US,en;q=0.9"},
+            timeout=4.5,
+            retries=0,
+            cache_ttl=1800.0,
+        )
+        if resp is None or getattr(resp, "status_code", 0) != 200:
+            return None
+        body = getattr(resp, "text", "") or ""
+        # Abort immediately if LinkedIn serves login/authwall page
+        if not body or any(w in body.lower() for w in ("authwall", "session_key", "sign in to linkedin")):
+            return None
+        soup = BeautifulSoup(body, "html.parser")
+        og_t = soup.find("meta", property="og:title")
+        og_d = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+        og_i = soup.find("meta", property="og:image")
+        title_txt = (og_t.get("content") or "").strip() if og_t else ""
+        desc_txt = (og_d.get("content") or "").strip() if og_d else ""
+        img_url = validate_image_url((og_i.get("content") or "").strip() if og_i else None)
+        if not title_txt:
+            return None
+        comp_low = (company_name or "").lower()
+        dom_root = domain.lower().replace("www.", "").split(".")[0]
+        combined_low = f"{title_txt} {desc_txt}".lower()
+        if not ((len(comp_low) >= 3 and comp_low in combined_low) or (len(dom_root) >= 3 and dom_root in combined_low)):
+            return None
+        parts = [p.strip() for p in re.split(r"\s+[-–—|]\s+", re.sub(r"\s*\|\s*LinkedIn.*$", "", title_txt, flags=re.I)) if p.strip()]
+        parsed_name = parts[0] if parts else ""
+        headline = parts[1] if len(parts) > 1 else desc_txt[:120]
+        loc_m = re.search(r"(?:Location|Based in|Greater\s+[A-Z][a-z]+|[A-Z][a-z]+,\s+[A-Z][a-zA-Z ]{2,20})", desc_txt)
+        return {
+            "name": parsed_name,
+            "title": headline[:80] if headline else "",
+            "bio": desc_txt[:260],
+            "location": loc_m.group(0) if loc_m else "",
+            "linkedin_og_image": img_url,
+            "linkedin_url": linkedin_url,
+        }
+
+    @classmethod
     async def fetch_and_build_linkedin_intelligence(
         cls,
         domain: str,
@@ -2783,17 +3465,18 @@ class LinkedInOSINTEngine:
         github_intel: dict[str, Any],
         enriched_email_profiles: list[dict[str, Any]],
         client: Optional[httpx.AsyncClient] = None,
+        online_employees: Optional[list[dict[str, Any]]] = None,
+        wiki_intel: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Asynchronously fetches and synthesizes complete LinkedIn company intelligence.
-        Identifies official LinkedIn company profile, queries company page for followers
-        and employee accounts, and builds unified directory.
+        Queries public LinkedIn pages, enriches public /in/ og:* meta (when served without login),
+        calls optional people-data API (when key configured), and merges a deduplicated directory.
         """
         clean_domain = domain.lower().strip()
         slug_fallback = re.sub(r"[^a-zA-Z0-9_-]", "-", company_name.lower().strip())
         domain_slug = clean_domain.replace("www.", "").split(".")[0]
 
-        # 1. Discover or resolve candidate LinkedIn company URLs
         company_url = f"https://www.linkedin.com/company/{slug_fallback}"
         company_slug = slug_fallback
         linkedin_profiles = [p for p in website_social_profiles if p.get("platform") == "LinkedIn"]
@@ -2810,7 +3493,6 @@ class LinkedInOSINTEngine:
                 if cand_clean and cand_clean not in [u.split("/")[-1] for u in urls_to_try]:
                     urls_to_try.append(f"https://www.linkedin.com/company/{cand_clean}")
 
-        # Add candidate slugs from Open Knowledge / Wikipedia harvester
         for c_slug in company_meta.get("candidate_slugs", []):
             c_url = f"https://www.linkedin.com/company/{c_slug}"
             if c_url not in urls_to_try:
@@ -2819,36 +3501,60 @@ class LinkedInOSINTEngine:
         crawled_employees: list[dict[str, Any]] = []
         company_details: dict[str, Any] = {}
 
-        # 2. Safely query the public LinkedIn company page
-        if client and urls_to_try:
-            for target_url in urls_to_try[:3]:
-                try:
-                    resp = await client.get(target_url, timeout=7.0)
-                    if resp.status_code == 200 and resp.text and len(resp.text) > 2000:
-                        company_url = str(resp.url).rstrip("/")
-                        company_slug = company_url.split("/")[-1].split("?")[0]
-                        c_meta, c_emps = cls.parse_linkedin_company_html(
-                            resp.text, clean_domain, company_name
-                        )
-                        company_details = c_meta
-                        crawled_employees.extend(c_emps)
+        # Query public LinkedIn company page via SSRF-safe request
+        for target_url in urls_to_try[:3]:
+            resp = await safe_osint_request("GET", target_url, client=client, timeout=6.0, retries=0, cache_ttl=1800.0)
+            if resp is not None and getattr(resp, "status_code", 0) == 200 and getattr(resp, "text", "") and len(resp.text) > 2000:
+                if "authwall" in resp.text.lower() or "session_key" in resp.text.lower():
+                    continue
+                company_url = str(getattr(resp, "url", target_url) or target_url).rstrip("/")
+                company_slug = company_url.split("/")[-1].split("?")[0]
+                c_meta, c_emps = cls.parse_linkedin_company_html(resp.text, clean_domain, company_name)
+                company_details = c_meta
+                crawled_employees.extend(c_emps)
+                if not any(p.get("platform") == "LinkedIn" and p.get("type") == "company" for p in website_social_profiles):
+                    website_social_profiles.append({
+                        "platform": "LinkedIn",
+                        "handle": company_slug,
+                        "url": company_url,
+                        "type": "company",
+                        "icon": "💼",
+                        "found_on_website": False,
+                        "source": "LinkedIn Public Directory",
+                    })
+                break
 
-                        # If not already present in website_social_profiles, add this discovered LinkedIn channel
-                        if not any(p.get("platform") == "LinkedIn" and p.get("type") == "company" for p in website_social_profiles):
-                            website_social_profiles.append({
-                                "platform": "LinkedIn",
-                                "handle": company_slug,
-                                "url": company_url,
-                                "type": "company",
-                                "icon": "💼",
-                                "found_on_website": False,
-                                "source": "LinkedIn Public Directory",
-                            })
-                        break
-                except Exception:
-                    pass
+        # Concurrently check optional people-data API & public /in/ og:* tags (up to 3 discovered profiles)
+        people_api_emps: list[dict[str, Any]] = []
+        personal_li_urls = []
+        for src_p in list(company_meta.get("founders", [])) + list(company_meta.get("scraped_team", [])) + list(online_employees or []):
+            lu = (src_p.get("linkedin_url") or "").strip()
+            if "linkedin.com/in/" in lu.lower() and lu not in personal_li_urls:
+                personal_li_urls.append(lu)
 
-        # 3. Build unified LinkedIn intelligence
+        og_results = await asyncio.gather(
+            OptionalPeopleDataProvider.lookup_company_people(clean_domain, company_name, client=client),
+            *[cls.fetch_public_profile_og(u, company_name, clean_domain, client=client) for u in personal_li_urls[:3]],
+            return_exceptions=True,
+        )
+        if isinstance(og_results[0], list):
+            people_api_emps = og_results[0]
+        for og_item in og_results[1:]:
+            if isinstance(og_item, dict) and og_item:
+                crawled_employees.append({
+                    "name": og_item["name"],
+                    "title": og_item.get("title") or "Team Member",
+                    "department": "Executive Leadership" if re.search(r"(founder|ceo|cto|coo|cfo|president|director)", og_item.get("title", ""), re.I) else "Operations & Business",
+                    "linkedin_url": og_item["linkedin_url"],
+                    "linkedin_og_image": og_item.get("linkedin_og_image"),
+                    "location": og_item.get("location", ""),
+                    "bio": og_item.get("bio", ""),
+                    "source": "LinkedIn Public Profile (og:meta)",
+                    "sources": ["LinkedIn Public Profile (og:meta)"],
+                    "confidence": "HIGH",
+                    "is_verified": True,
+                })
+
         return cls.build_linkedin_intelligence(
             domain=domain,
             company_name=company_name,
@@ -2858,6 +3564,9 @@ class LinkedInOSINTEngine:
             enriched_email_profiles=enriched_email_profiles,
             crawled_linkedin_employees=crawled_employees,
             company_details=company_details,
+            online_employees=online_employees,
+            people_api_employees=people_api_emps,
+            wiki_intel=wiki_intel,
         )
 
     @classmethod
@@ -2871,107 +3580,216 @@ class LinkedInOSINTEngine:
         enriched_email_profiles: list[dict[str, Any]],
         crawled_linkedin_employees: Optional[list[dict[str, Any]]] = None,
         company_details: Optional[dict[str, Any]] = None,
+        online_employees: Optional[list[dict[str, Any]]] = None,
+        people_api_employees: Optional[list[dict[str, Any]]] = None,
+        wiki_intel: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Synthesizes complete LinkedIn company overview, founder data,
-        employee directory, and targeted search queries.
+        Synthesizes deduplicated founders & employee directory across all OSINT sources:
+        merges fields by normalized name + LinkedIn slug + email, keeps sources[] list,
+        picks highest-priority photo (Wikipedia > official site > LinkedIn og:image > Gravatar),
+        and reports reported_employee_count separately from len(directory).
         """
         clean_domain = domain.lower().strip()
         slug_fallback = re.sub(r"[^a-zA-Z0-9_-]", "-", company_name.lower().strip())
 
-        # 1. Discover official LinkedIn Company URL
         company_url = f"https://www.linkedin.com/company/{slug_fallback}"
         company_slug = slug_fallback
         linkedin_profiles = [p for p in website_social_profiles if p.get("platform") == "LinkedIn"]
         company_pages = [p for p in linkedin_profiles if p.get("type") == "company"]
-
         if company_pages:
             company_url = company_pages[0]["url"]
             company_slug = company_pages[0]["handle"]
-
-        # 2. Curate Real Founders & Executives (Strictly verified people only, NO fake placeholders!)
-        founders: list[dict[str, Any]] = []
-        seen_founders: set[str] = set()
 
         def _clean_email_part(part: str, fallback: str) -> str:
             cleaned = re.sub(r"[^a-z0-9]", "", part.lower())
             return cleaned or fallback
 
+        def _norm_person_name(n: str) -> str:
+            return re.sub(r"[^a-z0-9 ]", "", re.sub(r"\s+", " ", (n or "").lower())).strip()
+
+        def _extract_li_slug(url: str) -> str:
+            m_li = re.search(r"linkedin\.com/in/([a-zA-Z0-9_.-]+)", url or "", re.I)
+            return m_li.group(1).rstrip("/").lower() if m_li else ""
+
+        def _photo_rank(url: str, src_hint: str = "") -> int:
+            u = (url or "").lower()
+            s = (src_hint or "").lower()
+            if not u:
+                return 99
+            if "wikimedia" in u or "wikipedia" in s:
+                return 1
+            if clean_domain.split(".")[0] in u or "website" in s or "json-ld" in s:
+                return 2
+            if "licdn" in u or "linkedin" in s or "og:image" in s:
+                return 3
+            if "gravatar" in u:
+                return 4
+            return 3
+
+        def _merge_records(existing: dict[str, Any], incoming: dict[str, Any]) -> None:
+            # Merge sources[]
+            ex_sources = existing.setdefault("sources", [existing.get("source")] if existing.get("source") else [])
+            for src_val in (incoming.get("sources") or ([incoming.get("source")] if incoming.get("source") else [])):
+                if src_val and src_val not in ex_sources:
+                    ex_sources.append(src_val)
+            existing["source"] = ex_sources[0] if ex_sources else existing.get("source", "")
+
+            # Merge source_references
+            ex_refs = existing.setdefault("source_references", [])
+            seen_ref_urls = {r.get("url") for r in ex_refs if isinstance(r, dict)}
+            for ref in incoming.get("source_references") or []:
+                if isinstance(ref, dict) and ref.get("url") not in seen_ref_urls:
+                    seen_ref_urls.add(ref.get("url"))
+                    ex_refs.append(ref)
+
+            # Pick best photo: Wikipedia > official site > LinkedIn og:image > Gravatar
+            inc_photo = incoming.get("photo_url") or incoming.get("avatar_url") or incoming.get("linkedin_og_image")
+            ex_photo = existing.get("photo_url") or existing.get("avatar_url")
+            inc_src_str = " ".join(incoming.get("sources") or [incoming.get("source") or ""])
+            ex_src_str = " ".join(ex_sources)
+            if inc_photo and (_photo_rank(inc_photo, inc_src_str) < _photo_rank(ex_photo or "", ex_src_str)):
+                existing["photo_url"] = inc_photo
+                existing["avatar_url"] = inc_photo
+
+            # Merge URLs & metadata fields if empty or generic
+            for k in ("linkedin_url", "wikipedia_url", "twitter_url", "github_url", "email", "location", "source_sentence"):
+                if incoming.get(k) and not existing.get(k):
+                    existing[k] = incoming[k]
+            if incoming.get("bio") and len(str(incoming["bio"])) > len(str(existing.get("bio") or "")):
+                existing["bio"] = incoming["bio"]
+            if incoming.get("bio_summary") and len(str(incoming["bio_summary"])) > len(str(existing.get("bio_summary") or "")):
+                existing["bio_summary"] = incoming["bio_summary"]
+            if incoming.get("biography"):
+                merged_b = dict(incoming["biography"])
+                merged_b.update(existing.get("biography") or {})
+                existing["biography"] = merged_b
+            if incoming.get("title") and existing.get("title") in ("", "Founder", "Staff / Team Member", "Team Member", "Associated Professional / Follower"):
+                if not any(w in incoming["title"].lower() for w in ("follower", "associated")):
+                    existing["title"] = incoming["title"]
+            # Confidence upgrade on multi-source corroboration
+            conf_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            cur_conf = existing.get("confidence") or "MEDIUM"
+            inc_conf = incoming.get("confidence") or "MEDIUM"
+            if len(ex_sources) >= 2:
+                existing["confidence"] = "HIGH"
+            elif conf_rank.get(inc_conf, 0) > conf_rank.get(cur_conf, 0):
+                existing["confidence"] = inc_conf
+
+        founders: list[dict[str, Any]] = []
+        seen_founders: dict[str, dict[str, Any]] = {}
+
         for f in company_meta.get("founders", []):
-            f_name = f.get("name", "").strip()
-            if f_name and f_name.lower() not in seen_founders:
-                seen_founders.add(f_name.lower())
-                f_parts = f_name.split()
-                first_name = _clean_email_part(f_parts[0], "user") if f_parts else "user"
-                last_name = _clean_email_part(f_parts[-1], "name") if len(f_parts) > 1 else "name"
-                inferred_email = f"{first_name}.{last_name}@{clean_domain}"
-                
-                founders.append(
-                    {
-                        "name": f_name,
-                        "title": f.get("title") or "Founder & Executive",
-                        "department": "Executive Leadership",
-                        "linkedin_url": f.get("linkedin_url") or "",
-                        "linkedin_search_url": f.get("linkedin_url") or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(f_name + ' ' + company_name)}",
-                        "avatar_url": f.get("avatar_url") or f.get("photo_url"),
-                        "photo_url": f.get("photo_url") or f.get("avatar_url"),
-                        "bio": f.get("bio") or f.get("bio_summary") or f"Leadership at {company_name}",
-                        "bio_summary": f.get("bio_summary") or f.get("bio") or "",
-                        "biography": f.get("biography") or {},
-                        "source_references": f.get("source_references") or [],
-                        "wikipedia_url": f.get("wikipedia_url") or "",
-                        "source": f.get("source") or "Website Team Page",
-                        "is_verified": True,
-                        "inferred_email": inferred_email,
-                        "risk_level": "High Risk: Primary Target for Spear-Phishing & BEC Impersonation",
-                    }
-                )
+            f_name = (f.get("name") or "").strip()
+            if not f_name:
+                continue
+            nk = _norm_person_name(f_name)
+            f_parts = f_name.split()
+            first_name = _clean_email_part(f_parts[0], "user") if f_parts else "user"
+            last_name = _clean_email_part(f_parts[-1], "name") if len(f_parts) > 1 else "name"
+            inferred_email = f"{first_name}.{last_name}@{clean_domain}"
+            rec = {
+                "name": f_name,
+                "title": f.get("title") or "Founder & Executive",
+                "role": f.get("title") or "Founder & Executive",
+                "department": "Executive Leadership",
+                "linkedin_url": f.get("linkedin_url") or "",
+                "twitter_url": f.get("twitter_url") or "",
+                "github_url": f.get("github_url") or "",
+                "linkedin_search_url": f.get("linkedin_url") or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(f_name + ' ' + company_name)}",
+                "avatar_url": f.get("avatar_url") or f.get("photo_url"),
+                "photo_url": f.get("photo_url") or f.get("avatar_url"),
+                "bio": f.get("bio") or f.get("bio_summary") or f"Leadership at {company_name}",
+                "bio_summary": f.get("bio_summary") or f.get("bio") or "",
+                "source_sentence": f.get("source_sentence") or "",
+                "biography": f.get("biography") or {},
+                "source_references": list(f.get("source_references") or []),
+                "wikipedia_url": f.get("wikipedia_url") or "",
+                "location": f.get("location") or "",
+                "email": f.get("email") or "",
+                "source": f.get("source") or "Website Team Page",
+                "sources": list(f.get("sources") or ([f.get("source")] if f.get("source") else ["Website Team Page"])),
+                "confidence": f.get("confidence") or ("HIGH" if f.get("wikipedia_url") or f.get("linkedin_url") else "MEDIUM"),
+                "is_verified": True,
+                "inferred_email": inferred_email,
+                "risk_level": "High Risk: Primary Target for Spear-Phishing & BEC Impersonation",
+            }
+            if nk in seen_founders:
+                _merge_records(seen_founders[nk], rec)
+            else:
+                seen_founders[nk] = rec
+                founders.append(rec)
 
-        # 3. Assemble Complete Employee Directory (Real scraped individuals only)
         employee_directory: list[dict[str, Any]] = []
-        seen_employees: set[str] = set()
-        seen_emp_li_slugs: set[str] = set()
+        by_name: dict[str, dict[str, Any]] = {}
+        by_slug: dict[str, dict[str, Any]] = {}
+        by_email: dict[str, dict[str, Any]] = {}
 
-        def add_employee(emp: dict[str, Any]):
-            name = emp.get("name", "").strip()
+        def add_employee(emp: dict[str, Any]) -> None:
+            name = (emp.get("name") or "").strip()
             li_url = (emp.get("linkedin_url") or "").strip()
-            li_m = re.search(r"linkedin\.com/in/([a-zA-Z0-9_.-]+)", li_url, re.I)
-            li_slug = li_m.group(1).rstrip("/").lower() if li_m else ""
-            key = (name.lower() or emp.get("email", "").lower() or li_url.lower())
-            if not key or key in seen_employees or (li_slug and li_slug in seen_emp_li_slugs):
+            li_slug = _extract_li_slug(li_url)
+            em = (emp.get("email") or "").strip().lower()
+            nk = _norm_person_name(name)
+            if not (nk or li_slug or em):
                 return
-            seen_employees.add(key)
-            if li_slug:
-                seen_emp_li_slugs.add(li_slug)
+
+            existing = (
+                (by_slug.get(li_slug) if li_slug else None)
+                or (by_email.get(em) if em else None)
+                or (by_name.get(nk) if nk else None)
+            )
+            if existing:
+                _merge_records(existing, emp)
+                if li_slug:
+                    by_slug[li_slug] = existing
+                if em:
+                    by_email[em] = existing
+                if nk:
+                    by_name[nk] = existing
+                return
+
+            if not emp.get("sources"):
+                emp["sources"] = [emp["source"]] if emp.get("source") else ["Public Footprint"]
+            if not emp.get("confidence"):
+                emp["confidence"] = "HIGH" if (li_url or emp.get("wikipedia_url")) else "MEDIUM"
+            photo = emp.get("photo_url") or emp.get("avatar_url") or emp.get("linkedin_og_image")
+            if photo:
+                emp["photo_url"] = photo
+                emp["avatar_url"] = photo
+
             employee_directory.append(emp)
+            if nk:
+                by_name[nk] = emp
+            if li_slug:
+                by_slug[li_slug] = emp
+            if em:
+                by_email[em] = emp
 
-        # Add verified founders first
         for f in founders:
-            add_employee(f)
+            add_employee(dict(f))
 
-        # Add scraped team members from website HTML/JS before fallback LinkedIn slugs
         for t in company_meta.get("scraped_team", []):
-            t_name = t.get("name", "").strip()
+            t_name = (t.get("name") or "").strip()
             t_parts = t_name.split()
             first_name = _clean_email_part(t_parts[0], "user") if t_parts else "user"
             last_name = _clean_email_part(t_parts[-1], "name") if len(t_parts) > 1 else "name"
             t["inferred_email"] = f"{first_name}.{last_name}@{clean_domain}"
             t["is_verified"] = True
+            t.setdefault("confidence", "HIGH")
+            t.setdefault("sources", [t.get("source") or "Website Team Page"])
             t["risk_level"] = "Elevated: Public Identity Exposes Corporate Structure"
             add_employee(t)
 
-        # Add crawled LinkedIn employees and followers from company page
-        if crawled_linkedin_employees:
-            for c_emp in crawled_linkedin_employees:
-                add_employee(c_emp)
-                # Only promote to founders if STRICTLY verified direct executive (never followers or general staff)
-                if c_emp.get("is_founder") and not any(w in c_emp.get("title", "").lower() for w in ["follower", "associated", "staff", "member"]):
-                    c_name = c_emp.get("name", "").strip()
-                    if c_name and c_name.lower() not in seen_founders:
-                        seen_founders.add(c_name.lower())
-                        founders.append(c_emp)
+        for c_emp in (crawled_linkedin_employees or []) + (online_employees or []) + (people_api_emps if 'people_api_emps' in locals() else []) + (people_api_employees or []):
+            add_employee(c_emp)
+            if c_emp.get("is_founder") and not any(w in c_emp.get("title", "").lower() for w in ["follower", "associated", "staff", "member"]):
+                c_name = (c_emp.get("name") or "").strip()
+                nk = _norm_person_name(c_name)
+                if nk and nk not in seen_founders:
+                    seen_founders[nk] = c_emp
+                    founders.append(c_emp)
 
-        # Add personal LinkedIn profiles discovered on the target website (only if not already matched above)
         for p in website_social_profiles:
             if p.get("platform") == "LinkedIn" and p.get("type") == "personal":
                 slug = p.get("handle") or ""
@@ -2980,7 +3798,6 @@ class LinkedInOSINTEngine:
                 p_parts = p_name.split()
                 first_name = _clean_email_part(p_parts[0], "user") if p_parts else "user"
                 last_name = _clean_email_part(p_parts[-1], "name") if len(p_parts) > 1 else "name"
-                inferred_email = f"{first_name}.{last_name}@{clean_domain}"
                 add_employee({
                     "name": p_name,
                     "title": "Staff / Team Member",
@@ -2988,37 +3805,39 @@ class LinkedInOSINTEngine:
                     "linkedin_url": p_url,
                     "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(p_name + ' ' + company_name)}",
                     "avatar_url": None,
-                    "inferred_email": inferred_email,
+                    "inferred_email": f"{first_name}.{last_name}@{clean_domain}",
                     "bio": f"Identified via website LinkedIn personal profile link: {p_url}",
                     "source": "Website LinkedIn Profile Link",
+                    "sources": ["Website LinkedIn Profile Link"],
+                    "confidence": "MEDIUM",
                     "is_verified": True,
                     "risk_level": "Elevated: Public Identity Exposes Corporate Structure",
                 })
 
-        # Add GitHub public organization members
         for m in github_intel.get("members", []):
             m_name = m.get("name") or m.get("login")
-            add_employee(
-                {
-                    "name": m_name,
-                    "title": f"Developer / Contributor (@{m.get('login')})",
-                    "department": "Engineering & Tech",
-                    "linkedin_url": "",
-                    "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(m_name + ' ' + company_name)}",
-                    "avatar_url": m.get("avatar_url"),
-                    "email": m.get("email"),
-                    "bio": m.get("bio") or f"Public GitHub member of @{github_intel.get('handle', '')}",
-                    "source": "GitHub Organization Member",
-                }
-            )
+            add_employee({
+                "name": m_name,
+                "title": f"Developer / Contributor (@{m.get('login')})",
+                "department": "Engineering & Tech",
+                "linkedin_url": "",
+                "github_url": f"https://github.com/{m.get('login')}" if m.get("login") else "",
+                "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(m_name + ' ' + company_name)}",
+                "avatar_url": m.get("avatar_url"),
+                "photo_url": m.get("avatar_url"),
+                "email": m.get("email"),
+                "location": m.get("location") or "",
+                "bio": m.get("bio") or f"Public GitHub member of @{github_intel.get('handle', '')}",
+                "source": "GitHub Organization Member",
+                "sources": ["GitHub Organization Member"],
+                "confidence": "HIGH",
+            })
 
-        # Add Behind the Email enriched identities
         for prof in enriched_email_profiles:
             p_data = prof.get("profile_enrichment", {})
             full_name = p_data.get("full_name") or p_data.get("username")
             inferred_role = p_data.get("inferred_role") or "Corporate Account"
             dept = p_data.get("department") or "Operations & Business"
-
             dept_normalized = "Operations & Business"
             if any(w in dept.lower() for w in ["security", "infrastructure"]):
                 dept_normalized = "Cybersecurity & IT"
@@ -3027,22 +3846,21 @@ class LinkedInOSINTEngine:
             elif any(w in dept.lower() for w in ["executive", "management", "founder"]):
                 dept_normalized = "Executive Leadership"
 
-            add_employee(
-                {
-                    "name": full_name,
-                    "title": inferred_role,
-                    "department": dept_normalized,
-                    "linkedin_url": "",
-                    "linkedin_search_url": p_data.get("linkedin_search_url")
-                    or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(full_name + ' ' + company_name)}",
-                    "avatar_url": prof.get("avatar_url"),
-                    "email": prof.get("email"),
-                    "bio": f"Role: {inferred_role} ({dept})",
-                    "source": "Discovered Corporate Identity",
-                }
-            )
+            add_employee({
+                "name": full_name,
+                "title": inferred_role,
+                "department": dept_normalized,
+                "linkedin_url": "",
+                "linkedin_search_url": p_data.get("linkedin_search_url") or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(full_name + ' ' + company_name)}",
+                "avatar_url": prof.get("avatar_url"),
+                "photo_url": prof.get("avatar_url"),
+                "email": prof.get("email"),
+                "bio": f"Role: {inferred_role} ({dept})",
+                "source": "Gravatar / Email Identity" if prof.get("avatar_url") else "Discovered Corporate Identity",
+                "sources": ["Gravatar / Email Identity"] if prof.get("avatar_url") else ["Discovered Corporate Identity"],
+                "confidence": "MEDIUM" if prof.get("avatar_url") else "LOW",
+            })
 
-        # 4. Role-based targeted Google Dorks for LinkedIn Reconnaissance
         dorks = [
             {
                 "role_category": "All Company Personnel",
@@ -3076,6 +3894,13 @@ class LinkedInOSINTEngine:
             },
         ]
 
+        reported_emp_count = (
+            (company_details or {}).get("estimated_employees")
+            or (wiki_intel or {}).get("estimated_employees")
+            or company_meta.get("estimated_employees")
+            or ""
+        )
+
         result_payload: dict[str, Any] = {
             "company_name": company_name,
             "company_url": company_url,
@@ -3086,6 +3911,8 @@ class LinkedInOSINTEngine:
             "founders": founders,
             "employees": employee_directory,
             "employee_count": len(employee_directory),
+            "directory_count": len(employee_directory),
+            "reported_employee_count": reported_emp_count,
             "dorks": dorks,
         }
 
@@ -3210,12 +4037,12 @@ class WebsiteIntelligenceEngine:
         }
 
         try:
-            # Check availability
-            resp = await client.get(
-                f"https://archive.org/wayback/available?url={domain}",
-                timeout=6.0,
+            # Check availability & CDX summary concurrently via safe_osint_request
+            resp, cdx_resp = await asyncio.gather(
+                safe_osint_request("GET", f"https://archive.org/wayback/available?url={domain}", client=client, timeout=6.0, cache_ttl=1800.0),
+                safe_osint_request("GET", f"https://web.archive.org/cdx/search/cdx?url={domain}&output=json&limit=5&fl=timestamp,statuscode&collapse=timestamp:4", client=client, timeout=7.5, cache_ttl=1800.0),
             )
-            if resp.status_code == 200:
+            if resp is not None and resp.status_code == 200:
                 wb_data = resp.json()
                 closest = wb_data.get("archived_snapshots", {}).get("closest", {})
                 if closest.get("available"):
@@ -3227,12 +4054,7 @@ class WebsiteIntelligenceEngine:
                     }
                     wayback["first_seen_url"] = closest.get("url", "")
 
-            # Get CDX summary for snapshot count and date range
-            cdx_resp = await client.get(
-                f"https://web.archive.org/cdx/search/cdx?url={domain}&output=json&limit=5&fl=timestamp,statuscode&collapse=timestamp:4",
-                timeout=8.0,
-            )
-            if cdx_resp.status_code == 200:
+            if cdx_resp is not None and cdx_resp.status_code == 200:
                 cdx_data = cdx_resp.json()
                 if len(cdx_data) > 1:  # First row is headers
                     rows = cdx_data[1:]

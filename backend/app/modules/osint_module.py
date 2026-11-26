@@ -10,6 +10,7 @@
 import asyncio
 import hashlib
 import html
+import logging
 import re
 import urllib.parse
 from typing import Any, Optional
@@ -24,7 +25,10 @@ from app.modules.osint_helpers import (
     WebsiteIntelligenceEngine,
     PublicKnowledgeHarvester,
     RDAPService,
+    RobotsTxtGuard,
+    safe_osint_request,
 )
+from app.modules.subdomain_module import SubdomainModule
 from app.modules.base import (
     BaseModule,
     FindingSeverity,
@@ -33,6 +37,8 @@ from app.modules.base import (
     ModuleResult,
     ProgressCallback,
 )
+
+logger = logging.getLogger("footprinthub.osint")
 
 
 class BehindTheEmailEngine:
@@ -215,25 +221,25 @@ class BehindTheEmailEngine:
 
         social_accounts: list[dict[str, Any]] = []
 
-        # 1-3. Run Gravatar, Duolingo, and GitHub passive checks concurrently (bounded timeouts)
+        # 1-3. Run Gravatar, Duolingo, and GitHub passive checks concurrently via safe_osint_request
         async def _check_gravatar() -> dict[str, Any]:
             gravatar_found = False
             gravatar_avatar = None
             gravatar_display = None
-            try:
-                resp = await client.get(f"https://en.gravatar.com/{md5_hash}.json", timeout=2.0)
-                if resp.status_code == 200:
+            resp = await safe_osint_request("GET", f"https://en.gravatar.com/{md5_hash}.json", client=client, timeout=2.5, retries=0)
+            if resp is not None and getattr(resp, "status_code", 0) == 200:
+                try:
                     g_data = resp.json().get("entry", [{}])[0]
                     gravatar_found = True
                     gravatar_display = g_data.get("displayName") or g_data.get("preferredUsername")
                     gravatar_avatar = g_data.get("thumbnailUrl") or f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
-                else:
-                    avatar_resp = await client.head(f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.8)
-                    if avatar_resp.status_code == 200:
-                        gravatar_found = True
-                        gravatar_avatar = f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            else:
+                avatar_resp = await safe_osint_request("HEAD", f"https://www.gravatar.com/avatar/{md5_hash}?d=404", client=client, timeout=2.0, retries=0)
+                if avatar_resp is not None and getattr(avatar_resp, "status_code", 0) == 200:
+                    gravatar_found = True
+                    gravatar_avatar = f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
             return {
                 "platform": "Gravatar",
                 "status": "found" if gravatar_found else "not_detected",
@@ -250,13 +256,15 @@ class BehindTheEmailEngine:
             duo_user = None
             duo_streak = 0
             duo_pic = None
-            try:
-                resp = await client.get(
-                    f"https://www.duolingo.com/2017-06-30/users?email={urllib.parse.quote(email_clean)}",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=2.2,
-                )
-                if resp.status_code == 200:
+            resp = await safe_osint_request(
+                "GET",
+                f"https://www.duolingo.com/2017-06-30/users?email={urllib.parse.quote(email_clean)}",
+                client=client,
+                timeout=2.5,
+                retries=0,
+            )
+            if resp is not None and getattr(resp, "status_code", 0) == 200:
+                try:
                     users = resp.json().get("users", [])
                     if users:
                         u = users[0]
@@ -266,8 +274,8 @@ class BehindTheEmailEngine:
                         pic = u.get("picture")
                         if pic:
                             duo_pic = f"https:{pic}" if pic.startswith("//") else pic
-            except Exception:
-                pass
+                except Exception:
+                    pass
             return {
                 "platform": "Duolingo",
                 "status": "found" if duo_found else "not_detected",
@@ -284,32 +292,40 @@ class BehindTheEmailEngine:
             gh_user = None
             gh_url = None
             gh_avatar = None
-            try:
-                gh_resp = await client.get(
-                    f"https://api.github.com/search/users?q={urllib.parse.quote(email_clean)}+in:email",
-                    headers={"User-Agent": "FootprintHub-OSINT"},
-                    timeout=2.2,
+            gh_resp = await safe_osint_request(
+                "GET",
+                f"https://api.github.com/search/users?q={urllib.parse.quote(email_clean)}+in:email",
+                client=client,
+                timeout=2.5,
+                retries=0,
+            )
+            if gh_resp is not None and getattr(gh_resp, "status_code", 0) == 200:
+                try:
+                    if gh_resp.json().get("total_count", 0) > 0:
+                        item = gh_resp.json().get("items", [])[0]
+                        gh_found = True
+                        gh_user = item.get("login")
+                        gh_url = item.get("html_url")
+                        gh_avatar = item.get("avatar_url")
+                except Exception:
+                    pass
+            if not gh_found and username:
+                u_resp = await safe_osint_request(
+                    "GET",
+                    f"https://api.github.com/users/{username}",
+                    client=client,
+                    timeout=2.0,
+                    retries=0,
                 )
-                if gh_resp.status_code == 200 and gh_resp.json().get("total_count", 0) > 0:
-                    item = gh_resp.json().get("items", [])[0]
-                    gh_found = True
-                    gh_user = item.get("login")
-                    gh_url = item.get("html_url")
-                    gh_avatar = item.get("avatar_url")
-                elif username:
-                    u_resp = await client.get(
-                        f"https://api.github.com/users/{username}",
-                        headers={"User-Agent": "FootprintHub-OSINT"},
-                        timeout=1.8,
-                    )
-                    if u_resp.status_code == 200:
+                if u_resp is not None and getattr(u_resp, "status_code", 0) == 200:
+                    try:
                         u_data = u_resp.json()
                         gh_found = True
                         gh_user = u_data.get("login")
                         gh_url = u_data.get("html_url")
                         gh_avatar = u_data.get("avatar_url")
-            except Exception:
-                pass
+                    except Exception:
+                        pass
             return {
                 "platform": "GitHub",
                 "status": "found" if gh_found else "query_ready",
@@ -552,10 +568,18 @@ class OSINTModule(BaseModule):
         self,
         target: str,
         on_progress: Optional[ProgressCallback] = None,
+        subdomains: Optional[list[Any]] = None,
     ) -> ModuleResult:
         findings: list[ModuleFinding] = []
         emails_found: set[str] = set()
         all_crawled_html: str = ""
+        errors: list[dict[str, str]] = []
+        subdomains_crawled: list[str] = []
+        pages_crawled: list[str] = []
+
+        def _record_error(step: str, reason: str) -> None:
+            errors.append({"step": step, "reason": str(reason)[:240]})
+            logger.warning("OSINT step '%s' issue for %s: %s", step, target, reason)
 
         # Normalize target domain and base domain
         clean_target = target.lower().strip().replace("https://", "").replace("http://", "").rstrip("/")
@@ -563,7 +587,7 @@ class OSINTModule(BaseModule):
 
         company_name = BehindTheEmailEngine.infer_company_name(base_domain)
 
-        self._progress(on_progress, 8, f"Crawling public surfaces, team pages & manifest for {clean_target}...")
+        self._progress(on_progress, 8, f"Expanding scope & crawling public surfaces for {clean_target}...")
 
         # Scrape multiple public paths for corporate emails, team info, and social profiles
         paths_to_crawl = [
@@ -608,6 +632,8 @@ class OSINTModule(BaseModule):
             "/people",
             "/people/",
             "/people.php",
+            "/careers",
+            "/careers/",
             "/who-we-are",
             "/who-we-are/",
             "/who-we-are.php",
@@ -621,41 +647,48 @@ class OSINTModule(BaseModule):
             "/management/",
         ]
 
-        # Use a persistent client with realistic browser headers and safe timeouts
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 FootprintHub/1.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        client = httpx.AsyncClient(timeout=8.0, follow_redirects=True, verify=False, headers=headers)
+        # All outbound HTTP requests use safe_osint_request (SSRF guard, honest User-Agent, retries)
+        client: Optional[httpx.AsyncClient] = None
         try:
-            # 1. Fetch homepage first to discover internal links dynamically (e.g. /about-us, /our-team)
+            # Step 1: High-value subdomain scope expansion
+            extra_hosts: list[str] = []
+            try:
+                if subdomains:
+                    extra_hosts = SubdomainModule.select_high_value_hosts(subdomains, base_domain)
+                else:
+                    extra_hosts = await asyncio.wait_for(
+                        SubdomainModule.discover_high_value_hosts(base_domain), timeout=6.5
+                    )
+                logger.info("OSINT Step 1 high-value hosts for %s: %s", base_domain, extra_hosts)
+            except Exception as exc:
+                _record_error("subdomain_expansion", f"Subdomain lookup failed ({type(exc).__name__}): {exc}")
+
+            # 1a. Fetch primary homepage first (via safe_osint_request + robots check)
             homepage_html = ""
             active_host = clean_target
             active_scheme = "https"
-            for probe_host in [clean_target, base_domain]:
-                try:
-                    resp = await client.get(f"https://{probe_host}/", timeout=6.0)
-                    if resp.status_code == 200 and resp.text:
+            for scheme_try in ("https", "http"):
+                for probe_host in [clean_target, base_domain]:
+                    base_url = f"{scheme_try}://{probe_host}"
+                    if not await RobotsTxtGuard.is_allowed(base_url, "/"):
+                        _record_error("robots_txt", f"Disallowed by robots.txt on {probe_host}/")
+                        continue
+                    resp = await safe_osint_request("GET", f"{base_url}/", timeout=6.0, retries=1)
+                    if resp is not None and resp.status_code == 200 and resp.text:
                         homepage_html = resp.text[:1500000]
                         active_host = urllib.parse.urlparse(str(resp.url)).netloc or probe_host
-                        active_scheme = "https"
+                        active_scheme = urllib.parse.urlparse(str(resp.url)).scheme or scheme_try
+                        if active_host not in subdomains_crawled:
+                            subdomains_crawled.append(active_host)
+                        if str(resp.url) not in pages_crawled:
+                            pages_crawled.append(str(resp.url))
                         all_crawled_html += homepage_html + "\n"
                         break
-                except Exception:
-                    pass
+                if homepage_html:
+                    break
+
             if not homepage_html:
-                for probe_host in [clean_target, base_domain]:
-                    try:
-                        resp = await client.get(f"http://{probe_host}/", timeout=6.0)
-                        if resp.status_code == 200 and resp.text:
-                            homepage_html = resp.text[:1500000]
-                            active_host = urllib.parse.urlparse(str(resp.url)).netloc or probe_host
-                            active_scheme = "http"
-                            all_crawled_html += homepage_html + "\n"
-                            break
-                    except Exception:
-                        pass
+                _record_error("website_crawl", f"Homepage unreachable on {clean_target}")
 
             # Dynamically discover navigation links from homepage (prioritize discovered routes FIRST)
             discovered_paths: list[str] = []
@@ -666,7 +699,7 @@ class OSINTModule(BaseModule):
                 for raw_link in all_raw_links:
                     raw_link = raw_link.strip()
                     lower_link = raw_link.lower()
-                    if any(kw in lower_link for kw in ["about", "team", "founder", "people", "leadership", "contact", "company", "who-we-are", "connect", "reach", "management", "board", "executive", "story"]):
+                    if any(kw in lower_link for kw in ["about", "team", "founder", "people", "leadership", "contact", "company", "who-we-are", "connect", "reach", "management", "board", "executive", "story", "career"]):
                         clean_href = raw_link.split("?")[0].split("#")[0].strip()
                         if clean_href.startswith("./"):
                             clean_href = "/" + clean_href[2:]
@@ -685,65 +718,82 @@ class OSINTModule(BaseModule):
                                 pass
 
             # Quick sitemap.xml check for high-signal about/team/leadership routes
-            try:
-                sm_resp = await client.get(f"{active_scheme}://{active_host}/sitemap.xml", timeout=2.5)
-                if sm_resp.status_code == 200 and "<loc>" in sm_resp.text:
-                    for loc in re.findall(r"<loc>(https?://[^<]+)</loc>", sm_resp.text, re.I):
-                        if any(kw in loc.lower() for kw in ["about", "team", "leader", "founder", "company", "who-we-are", "contact"]):
-                            p_sm = urllib.parse.urlparse(loc).path
-                            if p_sm and p_sm not in discovered_paths:
-                                discovered_paths.append(p_sm)
-                                if len(discovered_paths) >= 10:
-                                    break
-            except Exception:
-                pass
+            sm_resp = await safe_osint_request("GET", f"{active_scheme}://{active_host}/sitemap.xml", timeout=3.0, retries=0)
+            if sm_resp is not None and sm_resp.status_code == 200 and "<loc>" in sm_resp.text:
+                for loc in re.findall(r"<loc>(https?://[^<]+)</loc>", sm_resp.text, re.I):
+                    if any(kw in loc.lower() for kw in ["about", "team", "leader", "founder", "company", "who-we-are", "contact", "career"]):
+                        p_sm = urllib.parse.urlparse(loc).path
+                        if p_sm and p_sm not in discovered_paths:
+                            discovered_paths.append(p_sm)
+                            if len(discovered_paths) >= 12:
+                                break
 
-            # Put dynamically discovered paths BEFORE generic guesses; limit total sub-pages for speed
+            # Put dynamically discovered paths BEFORE generic guesses; crawl primary host + top extra subdomains
             merged_paths = discovered_paths + [p for p in paths_to_crawl if p not in discovered_paths]
             remaining_paths = [p for p in dict.fromkeys(merged_paths) if p not in ("", "/")][:14]
 
             crawl_sem = asyncio.Semaphore(6)
+            primary_base = f"{active_scheme}://{active_host}"
+            primary_robots_ok = await RobotsTxtGuard.is_allowed(primary_base, "/about")
 
-            async def _crawl_path(path: str) -> str:
+            async def _crawl_url(target_url: str, host_label: str) -> str:
                 async with crawl_sem:
-                    for attempt in range(2):
-                        try:
-                            url = f"{active_scheme}://{active_host}{path}"
-                            resp = await client.get(url, timeout=5.0)
-                            if resp.status_code == 200 and resp.text:
-                                return resp.text[:500000]
-                            break
-                        except Exception:
-                            if attempt == 0:
-                                await asyncio.sleep(0.25)
+                    resp = await safe_osint_request("GET", target_url, timeout=5.0, retries=1)
+                    if resp is not None and resp.status_code == 200 and resp.text:
+                        if host_label not in subdomains_crawled:
+                            subdomains_crawled.append(host_label)
+                        if target_url not in pages_crawled:
+                            pages_crawled.append(target_url)
+                        return resp.text[:500000]
                 return ""
 
-            if remaining_paths:
-                results_batch = await asyncio.gather(*[_crawl_path(p) for p in remaining_paths])
+            crawl_coros = []
+            if primary_robots_ok:
+                for p in remaining_paths:
+                    crawl_coros.append(_crawl_url(f"{primary_base}{p}", active_host))
+
+            # Step 1 extra high-value subdomain hosts (about.*, team.*, careers.*, blog.*, press.*, etc.)
+            secondary_hosts = [
+                h for h in extra_hosts
+                if h.lower() != active_host.lower() and h.lower() != clean_target.lower() and h.lower() != base_domain.lower()
+            ][:3]
+            for sec_host in secondary_hosts:
+                sec_base = f"https://{sec_host}"
+                if await RobotsTxtGuard.is_allowed(sec_base, "/"):
+                    for sp in ("/", "/about", "/team", "/careers"):
+                        crawl_coros.append(_crawl_url(f"{sec_base}{sp}", sec_host))
+
+            if crawl_coros:
+                results_batch = await asyncio.gather(*crawl_coros, return_exceptions=True)
                 for h_text in results_batch:
-                    if h_text:
+                    if isinstance(h_text, str) and h_text:
                         all_crawled_html += h_text + "\n"
+            logger.info("OSINT crawled %d pages across %d hosts for %s", len(pages_crawled), len(subdomains_crawled), base_domain)
 
             # Optional WordPress public users API discovery if WordPress markers detected
             wp_users_found: list[dict[str, Any]] = []
             if "wp-content" in all_crawled_html or "wp-json" in all_crawled_html:
-                try:
-                    wp_r = await client.get(f"{active_scheme}://{active_host}/wp-json/wp/v2/users?per_page=8", timeout=3.0)
-                    if wp_r.status_code == 200 and isinstance(wp_r.json(), list):
-                        for wp_u in wp_r.json():
-                            wp_name = (wp_u.get("name") or "").strip()
-                            if 2 <= len(wp_name.split()) <= 4 and not any(bad in wp_name.lower() for bad in ["admin", "editor", "author", "test", "support"]):
-                                wp_users_found.append({
-                                    "name": wp_name,
-                                    "title": "Author / Contributor (WordPress)",
-                                    "department": "Engineering & Tech",
-                                    "linkedin_url": "",
-                                    "avatar_url": (wp_u.get("avatar_urls") or {}).get("96"),
-                                    "bio": wp_u.get("description") or f"Published author on {clean_target}",
-                                    "source": "WordPress Public API (/wp-json/wp/v2/users)",
-                                })
-                except Exception:
-                    pass
+                wp_r = await safe_osint_request("GET", f"{primary_base}/wp-json/wp/v2/users?per_page=8", timeout=3.5, retries=0)
+                if wp_r is not None and wp_r.status_code == 200:
+                    try:
+                        wp_list = wp_r.json()
+                        if isinstance(wp_list, list):
+                            for wp_u in wp_list:
+                                wp_name = (wp_u.get("name") or "").strip()
+                                if 2 <= len(wp_name.split()) <= 4 and not any(bad in wp_name.lower() for bad in ["admin", "editor", "author", "test", "support"]):
+                                    wp_users_found.append({
+                                        "name": wp_name,
+                                        "title": "Author / Contributor (WordPress)",
+                                        "department": "Engineering & Tech",
+                                        "linkedin_url": "",
+                                        "avatar_url": (wp_u.get("avatar_urls") or {}).get("96"),
+                                        "bio": wp_u.get("description") or f"Published author on {clean_target}",
+                                        "source": "WordPress Public API (/wp-json/wp/v2/users)",
+                                        "sources": ["WordPress Public API"],
+                                        "confidence": "HIGH",
+                                    })
+                    except Exception:
+                        pass
 
             # ── 2. SPA JS Bundle & Lazy Chunk Crawling (React / Vite / Next.js / Vue) ──
             crawled_js_list: list[str] = []
@@ -782,15 +832,11 @@ class OSINTModule(BaseModule):
 
                 async def _fetch_js(url: str) -> tuple[str, str]:
                     async with js_sem:
-                        for attempt in range(2):
-                            try:
-                                r = await client.get(url, timeout=6.0)
-                                if r.status_code == 200 and r.text:
-                                    return (url, r.text[:1200000])
-                                break
-                            except Exception:
-                                if attempt == 0:
-                                    await asyncio.sleep(0.3)
+                        r = await safe_osint_request("GET", url, timeout=6.0, retries=1)
+                        if r is not None and r.status_code == 200 and r.text:
+                            if url not in pages_crawled:
+                                pages_crawled.append(url)
+                            return (url, r.text[:1200000])
                     return (url, "")
 
                 if entry_js_candidates:
@@ -913,8 +959,12 @@ class OSINTModule(BaseModule):
                 res_wiki, res_online = await asyncio.gather(wiki_task, online_task, return_exceptions=True)
                 if isinstance(res_wiki, dict):
                     wiki_intel = res_wiki
+                elif isinstance(res_wiki, Exception):
+                    _record_error("wikipedia_enrichment", f"{type(res_wiki).__name__}: {res_wiki}")
                 if isinstance(res_online, dict):
                     online_intel = res_online
+                elif isinstance(res_online, Exception):
+                    _record_error("online_search", f"{type(res_online).__name__}: {res_online}")
 
                 # If primary Wikipedia search missed the company article, probe any Wikipedia titles discovered by live web search
                 if wiki_intel.get("wikipedia_status") != "found" and online_intel.get("wikipedia_titles"):
@@ -930,10 +980,28 @@ class OSINTModule(BaseModule):
                         )
                         if isinstance(fallback_wiki, dict) and fallback_wiki.get("wikipedia_status") == "found":
                             wiki_intel = fallback_wiki
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _record_error("wikipedia_title_probe", f"{type(exc).__name__}: {exc}")
 
-                # Merge Wikipedia company data
+                # Structured Wikidata fallback if Wikipedia still missing or missing key org fields
+                if wiki_intel.get("wikipedia_status") != "found" and not wiki_intel.get("wikidata_id"):
+                    try:
+                        wd_fb = await asyncio.wait_for(
+                            PublicKnowledgeHarvester.query_wikidata_fallback(company_name, base_domain, client=client),
+                            timeout=4.5,
+                        )
+                        if wd_fb:
+                            for fk in ("wikidata_id", "wikidata_url", "headquarters", "founded_year", "estimated_employees", "parent_organization", "logo", "linkedin_id"):
+                                if wd_fb.get(fk) and not wiki_intel.get(fk):
+                                    wiki_intel[fk] = wd_fb[fk]
+                            if wd_fb.get("founders"):
+                                wiki_intel.setdefault("founders", []).extend(wd_fb["founders"])
+                            if wd_fb.get("linkedin_id"):
+                                wiki_intel.setdefault("candidate_slugs", []).append(wd_fb["linkedin_id"])
+                    except Exception as exc:
+                        _record_error("wikidata_fallback", f"{type(exc).__name__}: {exc}")
+
+                # Merge Wikipedia/Wikidata company data
                 if wiki_intel.get("description") and not company_meta.get("description"):
                     company_meta["description"] = wiki_intel["description"]
                 if wiki_intel.get("industry") and (not company_meta.get("industry") or company_meta.get("industry") == "Technology & Software"):
@@ -945,6 +1013,11 @@ class OSINTModule(BaseModule):
                 ):
                     company_meta["founded_year"] = wiki_intel["founded_year"]
                     company_meta["founded_source"] = "wikipedia"
+                for extra_k in ("parent_organization", "revenue", "products", "wikidata_url"):
+                    if wiki_intel.get(extra_k) and not company_meta.get(extra_k):
+                        company_meta[extra_k] = wiki_intel[extra_k]
+                if wiki_intel.get("logo") and not company_meta.get("logo"):
+                    company_meta["logo"] = wiki_intel["logo"]
                 if wiki_intel.get("source_url"):
                     company_meta["wikipedia_url"] = wiki_intel["source_url"]
                 if wiki_intel.get("wikidata_id"):
@@ -957,10 +1030,21 @@ class OSINTModule(BaseModule):
                         for k, v in f.items():
                             if v and not existing.get(k):
                                 existing[k] = v
+                        for sv in (f.get("sources") or []):
+                            if sv not in existing.setdefault("sources", []):
+                                existing["sources"].append(sv)
                     else:
                         company_meta.setdefault("founders", []).insert(0, f)
                 if wiki_intel.get("candidate_slugs"):
                     company_meta.setdefault("candidate_slugs", []).extend(wiki_intel["candidate_slugs"])
+
+                # Merge sameAs social links from JSON-LD
+                if company_meta.get("same_as_links"):
+                    for sa_soc in SocialMediaScraper.extract_social_links(" ".join(company_meta["same_as_links"])):
+                        sk = f"{sa_soc['platform']}:{sa_soc['handle'].lower()}"
+                        if sk not in {f"{s['platform']}:{s['handle'].lower()}" for s in website_social_profiles}:
+                            sa_soc["source"] = "Schema.org sameAs"
+                            website_social_profiles.append(sa_soc)
 
                 # Merge live online search intelligence (founders, social profiles, LinkedIn company URL)
                 for f_on in online_intel.get("founders", []):
@@ -970,6 +1054,9 @@ class OSINTModule(BaseModule):
                             existing["linkedin_url"] = f_on["linkedin_url"]
                         if f_on.get("bio") and len(existing.get("bio", "")) < 40:
                             existing["bio"] = f_on["bio"]
+                        for sv in (f_on.get("sources") or []):
+                            if sv not in existing.setdefault("sources", []):
+                                existing["sources"].append(sv)
                     else:
                         company_meta.setdefault("founders", []).append(f_on)
 
@@ -984,8 +1071,8 @@ class OSINTModule(BaseModule):
                     li_slug = online_intel["linkedin_company_url"].rstrip("/").split("/")[-1]
                     if li_slug and li_slug not in company_meta.get("candidate_slugs", []):
                         company_meta.setdefault("candidate_slugs", []).append(li_slug)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_error("external_enrichment", f"{type(exc).__name__}: {exc}")
 
             # Enrich discovered founders via Wikipedia person profiles and portrait lookup (bounded timeout)
             if company_meta.get("founders"):
@@ -1033,16 +1120,58 @@ class OSINTModule(BaseModule):
                 except Exception:
                     pass
 
-            # Fallback founded_year from RDAP domain registration if still missing
-            if not company_meta.get("founded_year"):
-                try:
-                    rdap_info = await asyncio.wait_for(RDAPService.query_rdap(base_domain, client=client), timeout=4.0)
-                    if rdap_info.get("registered_date"):
-                        ym = re.search(r"(19\d\d|20\d\d)", str(rdap_info["registered_date"]))
-                        if ym:
-                            company_meta["founded_year"] = f"{ym.group(1)} (Domain Reg.)"
-                except Exception:
-                    pass
+            # Step 3/6: Query RDAP registration info (disclosure audit + founded_year fallback) & security.txt
+            rdap_info: dict[str, Any] = {}
+            sec_txt_resp = None
+            try:
+                rdap_res, sec_res = await asyncio.gather(
+                    asyncio.wait_for(RDAPService.query_rdap(base_domain, client=client), timeout=4.5),
+                    safe_osint_request("GET", f"{primary_base}/.well-known/security.txt", timeout=3.5, retries=0),
+                    return_exceptions=True,
+                )
+                if isinstance(rdap_res, dict):
+                    rdap_info = rdap_res
+                elif isinstance(rdap_res, Exception):
+                    _record_error("rdap_lookup", f"{type(rdap_res).__name__}: {rdap_res}")
+                if not isinstance(sec_res, Exception):
+                    sec_txt_resp = sec_res
+            except Exception as exc:
+                _record_error("rdap_and_security_txt", f"{type(exc).__name__}: {exc}")
+
+            if not company_meta.get("founded_year") and rdap_info.get("registered_date"):
+                ym = re.search(r"(19\d\d|20\d\d)", str(rdap_info["registered_date"]))
+                if ym:
+                    company_meta["founded_year"] = f"{ym.group(1)} (Domain Reg.)"
+
+            if rdap_info.get("registrar"):
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.INFO,
+                        title=f"Domain Registration & Registrar Disclosed ({rdap_info['registrar']})",
+                        description=(
+                            f"RDAP public registry for {base_domain} (https://rdap.org/domain/{base_domain}) exposes "
+                            f"registrar '{rdap_info['registrar']}', registered {rdap_info.get('registered_date') or 'N/A'}, "
+                            f"expires {rdap_info.get('expiration_date') or 'N/A'}."
+                        ),
+                        remediation="Enable registrar lock and WHOIS/RDAP privacy protection if not required publicly.",
+                    )
+                )
+
+            sec_txt_missing = True
+            if sec_txt_resp is not None and getattr(sec_txt_resp, "status_code", 0) == 200 and "contact:" in (getattr(sec_txt_resp, "text", "") or "").lower():
+                sec_txt_missing = False
+            if sec_txt_missing:
+                findings.append(
+                    ModuleFinding(
+                        severity=FindingSeverity.LOW,
+                        title="Missing security.txt Vulnerability Disclosure Contact",
+                        description=(
+                            f"No valid RFC 9116 security.txt file was found at {primary_base}/.well-known/security.txt. "
+                            "Security researchers lack a standardized vulnerability reporting channel."
+                        ),
+                        remediation=f"Publish {primary_base}/.well-known/security.txt with Contact, Expires, and Preferred-Languages fields.",
+                    )
+                )
 
             # Merge any contact emails discovered in company_meta into emails_found
             for c_em in company_meta.get("contact_emails", []):
@@ -1062,15 +1191,16 @@ class OSINTModule(BaseModule):
                         ),
                         timeout=4.5,
                     )
-                except Exception:
+                except Exception as exc:
                     github_intel = {}
+                    _record_error("github_intel", f"{type(exc).__name__}: {exc}")
                 if github_intel.get("members"):
                     findings.append(
                         ModuleFinding(
                             severity=FindingSeverity.INFO,
                             title=f"GitHub Organization Members Exposed ({len(github_intel['members'])} public)",
                             description=(
-                                f"The GitHub organization @{github_handles[0]} has {len(github_intel['members'])} "
+                                f"The GitHub organization @{github_handles[0]} (https://github.com/{github_handles[0]}) has {len(github_intel['members'])} "
                                 f"publicly visible members. Member profiles may reveal employee names, emails, "
                                 f"locations, and technology stack preferences."
                             ),
@@ -1097,14 +1227,20 @@ class OSINTModule(BaseModule):
             hunter_key = getattr(settings, "HUNTER_IO_API_KEY", None)
             if hunter_key:
                 self._progress(on_progress, 40, "Querying Hunter.io email database...")
-                try:
-                    resp = await client.get(f"https://api.hunter.io/v2/domain-search?domain={base_domain}&api_key={hunter_key}", timeout=6.0)
-                    if resp.status_code == 200:
+                resp = await safe_osint_request(
+                    "GET",
+                    f"https://api.hunter.io/v2/domain-search?domain={base_domain}&api_key={hunter_key}",
+                    timeout=6.0,
+                    retries=0,
+                )
+                if resp is not None and resp.status_code == 200:
+                    try:
                         h_data = resp.json().get("data", {})
                         for em in h_data.get("emails", []):
-                            emails_found.add(em.get("value", "").lower())
-                except Exception:
-                    pass
+                            if em.get("value"):
+                                emails_found.add(em["value"].lower())
+                    except Exception:
+                        pass
 
             # Synthesize corporate probes if none found
             synthesized_probes = [
@@ -1182,10 +1318,13 @@ class OSINTModule(BaseModule):
                         github_intel=github_intel,
                         enriched_email_profiles=behind_the_email_profiles,
                         client=client,
+                        online_employees=online_intel.get("employees", []),
+                        wiki_intel=wiki_intel,
                     ),
-                    timeout=8.0,
+                    timeout=9.0,
                 )
-            except Exception:
+            except Exception as exc:
+                _record_error("linkedin_enrichment", f"{type(exc).__name__}: {exc}")
                 linkedin_intelligence = LinkedInOSINTEngine.build_linkedin_intelligence(
                     domain=base_domain,
                     company_name=company_name,
@@ -1193,6 +1332,8 @@ class OSINTModule(BaseModule):
                     company_meta=company_meta,
                     github_intel=github_intel,
                     enriched_email_profiles=behind_the_email_profiles,
+                    online_employees=online_intel.get("employees", []),
+                    wiki_intel=wiki_intel,
                 )
 
             # ── Digital Footprint & Registries Engine ───────────────────────────
@@ -1314,6 +1455,102 @@ class OSINTModule(BaseModule):
 
             self._progress(on_progress, 100, "OSINT reconnaissance completed")
 
+            # Build structured `osint` schema alongside backward-compatible top-level keys
+            org_sources: list[str] = []
+            if homepage_html:
+                org_sources.append(f"{primary_base}/")
+            if company_meta.get("json_ld_detected"):
+                org_sources.append("Schema.org JSON-LD")
+            if wiki_intel.get("source_url"):
+                org_sources.append(wiki_intel["source_url"])
+            if wiki_intel.get("wikidata_url") or company_meta.get("wikidata_url"):
+                org_sources.append(wiki_intel.get("wikidata_url") or company_meta.get("wikidata_url"))
+            if rdap_info.get("registrar"):
+                org_sources.append(f"https://rdap.org/domain/{base_domain}")
+
+            org_payload = {
+                "name": company_name,
+                "description": company_meta.get("description") or company_meta.get("about_company") or "",
+                "industry": company_meta.get("industry") or "Technology & Software",
+                "founded": company_meta.get("founded_year") or "",
+                "hq": company_meta.get("headquarters") or "",
+                "employee_count": linkedin_intelligence.get("reported_employee_count") or company_meta.get("estimated_employees") or "",
+                "directory_count": linkedin_intelligence.get("directory_count", emp_count),
+                "parent_company": company_meta.get("parent_organization") or wiki_intel.get("parent_organization") or "",
+                "revenue": company_meta.get("revenue") or wiki_intel.get("revenue") or "",
+                "products": company_meta.get("products") or wiki_intel.get("products") or "",
+                "logo": company_meta.get("logo") or linkedin_intelligence.get("logo_url") or wiki_intel.get("logo") or None,
+                "website": primary_base,
+                "wikipedia_url": wiki_intel.get("source_url") or company_meta.get("wikipedia_url") or "",
+                "wikidata_id": wiki_intel.get("wikidata_id") or company_meta.get("wikidata_id") or "",
+                "wikidata_url": wiki_intel.get("wikidata_url") or company_meta.get("wikidata_url") or "",
+                "sources": org_sources,
+            }
+
+            osint_founders = [
+                {
+                    "name": f.get("name", ""),
+                    "role": f.get("role") or f.get("title") or "Founder",
+                    "title": f.get("title") or f.get("role") or "Founder",
+                    "bio": f.get("bio") or f.get("bio_summary") or "",
+                    "source_sentence": f.get("source_sentence") or "",
+                    "image_url": f.get("photo_url") or f.get("avatar_url"),
+                    "photo_url": f.get("photo_url") or f.get("avatar_url"),
+                    "linkedin_url": f.get("linkedin_url") or "",
+                    "wikipedia_url": f.get("wikipedia_url") or "",
+                    "twitter_url": f.get("twitter_url") or "",
+                    "github_url": f.get("github_url") or "",
+                    "sources": f.get("sources") or ([f["source"]] if f.get("source") else []),
+                    "source_references": f.get("source_references") or [],
+                    "biography": f.get("biography") or {},
+                    "confidence": f.get("confidence") or "MEDIUM",
+                    "inferred_email": f.get("inferred_email") or "",
+                }
+                for f in founders_list
+            ]
+
+            osint_employees = [
+                {
+                    "name": e.get("name", ""),
+                    "title": e.get("title") or "Team Member",
+                    "department": e.get("department") or "Operations & Business",
+                    "image_url": e.get("photo_url") or e.get("avatar_url"),
+                    "avatar_url": e.get("avatar_url") or e.get("photo_url"),
+                    "linkedin_url": e.get("linkedin_url") or "",
+                    "linkedin_search_url": e.get("linkedin_search_url") or "",
+                    "location": e.get("location") or "",
+                    "email": e.get("email") or e.get("inferred_email") or "",
+                    "inferred_email": e.get("inferred_email") or e.get("email") or "",
+                    "sources": e.get("sources") or ([e["source"]] if e.get("source") else []),
+                    "source": e.get("source") or "",
+                    "source_references": e.get("source_references") or [],
+                    "confidence": e.get("confidence") or "MEDIUM",
+                }
+                for e in linkedin_intelligence.get("employees", [])
+            ]
+
+            social_by_platform: dict[str, list[dict[str, Any]]] = {}
+            for sp in website_social_profiles:
+                social_by_platform.setdefault(sp.get("platform", "Other"), []).append(sp)
+
+            osint_schema = {
+                "organization": org_payload,
+                "founders": osint_founders,
+                "employees": osint_employees,
+                "social_profiles": {
+                    "total": len(website_social_profiles),
+                    "by_platform": social_by_platform,
+                    "all": website_social_profiles,
+                },
+                "wikipedia": wiki_intel,
+                "subdomains_crawled": subdomains_crawled,
+                "pages_crawled": pages_crawled,
+                "emails": sorted(emails_found),
+                "errors": errors,
+                "search_provider": online_intel.get("search_provider") or "Public Web Fallback",
+                "provider_configured": bool(online_intel.get("provider_configured", False)),
+            }
+
             return ModuleResult(
                 module_name=self.name,
                 mode=self.mode,
@@ -1322,6 +1559,7 @@ class OSINTModule(BaseModule):
                     "target": target,
                     "domain": base_domain,
                     "company_name": company_name,
+                    "osint": osint_schema,
                     "company_metadata": company_meta,
                     "public_knowledge": wiki_intel,
                     "online_search": online_intel,
@@ -1334,11 +1572,16 @@ class OSINTModule(BaseModule):
                     "website_social_profiles": website_social_profiles,
                     "github_intelligence": github_intel,
                     "behind_the_email": behind_the_email_profiles,
-                    "emails": list(emails_found),
+                    "emails": sorted(emails_found),
+                    "rdap": rdap_info,
+                    "subdomains_crawled": subdomains_crawled,
+                    "pages_crawled": pages_crawled,
+                    "errors": errors,
                     "google_dorks": google_dorks,
                     "github_recon": github_queries,
                 },
                 findings=findings,
             )
         finally:
-            await client.aclose()
+            if client is not None:
+                await client.aclose()

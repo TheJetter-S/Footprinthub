@@ -7,13 +7,14 @@
 
 import asyncio
 import re
+import time
 from typing import Any, Optional
 
 import dns.asyncresolver
 import dns.exception
 import dns.resolver
-import httpx
 
+from app.core.safe_request import safe_request
 from app.modules.base import (
     BaseModule,
     FindingSeverity,
@@ -22,6 +23,14 @@ from app.modules.base import (
     ModuleResult,
     ProgressCallback,
 )
+
+# High-value hosts selected from subdomain results for OSINT crawling
+HIGH_VALUE_OSINT_PREFIXES = (
+    "www", "about", "team", "careers", "blog",
+    "press", "investors", "docs", "support", "app",
+)
+_SUBDOMAIN_RESULTS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_SUBDOMAIN_CACHE_TTL = 600.0
 
 # Known takeover target CNAME suffixes and their dangling response indicators
 TAKEOVER_SIGNATURES: dict[str, dict[str, str]] = {
@@ -109,6 +118,7 @@ class SubdomainModule(BaseModule):
 
         self._progress(on_progress, 50, f"Resolving {len(discovered_names)} candidate subdomains...")
         resolved_subdomains = await self._resolve_subdomains(target, list(discovered_names))
+        _SUBDOMAIN_RESULTS_CACHE[target.lower().strip()] = (time.time(), list(resolved_subdomains))
 
         self._progress(on_progress, 75, "Checking for dangling CNAMEs / takeover vulnerabilities...")
         takeover_findings = await self._check_takeovers(resolved_subdomains)
@@ -134,25 +144,80 @@ class SubdomainModule(BaseModule):
         )
 
     async def _query_crt_sh(self, domain: str) -> set[str]:
-        """Query crt.sh Certificate Transparency logs."""
+        """Query crt.sh Certificate Transparency logs via SSRF-safe safe_request."""
         subdomains = set()
         url = f"https://crt.sh/?q=%25.{domain}&output=json"
         try:
-            async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "FootprintHub/1.0"}) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    entries = resp.json()
-                    for item in entries:
-                        name_value = item.get("name_value", "")
-                        for line in name_value.split("\n"):
-                            line = line.strip().lower()
-                            if line.startswith("*."):
-                                line = line[2:]
-                            if line.endswith(domain) and line != domain and "*" not in line:
-                                subdomains.add(line)
+            resp = await safe_request("GET", url, timeout=15.0)
+            if resp.status_code == 200:
+                entries = resp.json()
+                for item in entries:
+                    name_value = item.get("name_value", "")
+                    for line in name_value.split("\n"):
+                        line = line.strip().lower()
+                        if line.startswith("*."):
+                            line = line[2:]
+                        if line.endswith(domain) and line != domain and "*" not in line:
+                            subdomains.add(line)
         except Exception:
             pass  # crt.sh can occasionally time out or be rate-limited
         return subdomains
+
+    @classmethod
+    def select_high_value_hosts(cls, subdomains: list[Any], target_domain: str) -> list[str]:
+        """Select high-value hosts (www, about, team, careers, blog, press, investors, docs, support, app) from subdomain results."""
+        base = target_domain.lower().strip().replace("https://", "").replace("http://", "").split("/")[0]
+        if base.startswith("www."):
+            base = base[4:]
+        priority_map: dict[str, int] = {p: idx for idx, p in enumerate(HIGH_VALUE_OSINT_PREFIXES)}
+        selected: dict[str, int] = {}
+
+        for item in subdomains:
+            host = item.get("subdomain", "") if isinstance(item, dict) else str(item)
+            host = host.lower().strip().rstrip(".")
+            if not host or (host != base and not host.endswith(f".{base}")):
+                continue
+            prefix = host[: -(len(base) + 1)] if host != base else ""
+            top_label = prefix.split(".")[0] if prefix else ""
+            if host == base:
+                selected[host] = -1
+            elif top_label in priority_map:
+                selected[host] = priority_map[top_label]
+
+        return [h for h, _ in sorted(selected.items(), key=lambda kv: (kv[1], kv[0]))]
+
+    @classmethod
+    async def discover_high_value_hosts(cls, target_domain: str) -> list[str]:
+        """
+        Return high-value OSINT hosts for target_domain, reusing cached SubdomainModule
+        results when available or performing a quick CT/DNS lookup of OSINT prefixes.
+        """
+        base = target_domain.lower().strip().replace("https://", "").replace("http://", "").split("/")[0]
+        if base.startswith("www."):
+            base = base[4:]
+
+        cached = _SUBDOMAIN_RESULTS_CACHE.get(base)
+        if cached and (time.time() - cached[0]) < _SUBDOMAIN_CACHE_TTL:
+            hosts = cls.select_high_value_hosts(cached[1], base)
+            return hosts[:8]
+
+        mod = cls()
+        candidates = [f"{p}.{base}" for p in HIGH_VALUE_OSINT_PREFIXES]
+        try:
+            ct_hosts = await asyncio.wait_for(mod._query_crt_sh(base), timeout=5.0)
+            for h in ct_hosts:
+                prefix = h[: -(len(base) + 1)] if h.endswith(f".{base}") else ""
+                if prefix.split(".")[0] in HIGH_VALUE_OSINT_PREFIXES and h not in candidates:
+                    candidates.append(h)
+        except Exception:
+            pass
+
+        try:
+            resolved = await asyncio.wait_for(mod._resolve_subdomains(base, candidates[:20]), timeout=6.0)
+            _SUBDOMAIN_RESULTS_CACHE[base] = (time.time(), list(resolved))
+            return cls.select_high_value_hosts(resolved, base)[:8]
+        except Exception:
+            return [f"www.{base}", base]
 
     async def _resolve_subdomains(
         self,
@@ -215,11 +280,10 @@ class SubdomainModule(BaseModule):
             for cname in item.get("cnames", []):
                 for suffix, sig in TAKEOVER_SIGNATURES.items():
                     if cname.endswith(suffix):
-                        # CNAME points to a known cloud provider. Probe HTTP response.
+                        # CNAME points to a known cloud provider. Probe HTTP response via safe_request.
                         try:
-                            async with httpx.AsyncClient(timeout=6.0, verify=False) as client:
-                                resp = await client.get(f"http://{subdomain}", follow_redirects=True)
-                                if sig["fingerprint"].lower() in resp.text.lower():
+                            resp = await safe_request("GET", f"http://{subdomain}", timeout=6.0)
+                            if sig["fingerprint"].lower() in resp.text.lower():
                                     findings.append(
                                         ModuleFinding(
                                             severity=sig["severity"],

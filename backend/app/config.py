@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     HIBP_API_KEY: Optional[str] = None
     GOOGLE_SAFE_BROWSING_API_KEY: Optional[str] = None
     GITHUB_TOKEN: Optional[str] = None
+    SEARCH_PROVIDER: str = "auto"
+    BRAVE_API_KEY: Optional[str] = None
+    SERPAPI_KEY: Optional[str] = None
+    BING_SEARCH_API_KEY: Optional[str] = None
+    PEOPLE_DATA_API_KEY: Optional[str] = None
+    PEOPLE_DATA_API_URL: Optional[str] = None
 
     # ── Rate Limiting ───────────────────────────────────────────────────────
     RATE_LIMIT_PER_MINUTE: int = 10

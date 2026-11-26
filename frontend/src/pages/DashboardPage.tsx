@@ -1267,20 +1267,37 @@ function buildFallbackInternetIntel(targetDomain: string, companyName: string) {
 }
 
 function OSINTResultView({ data }: { data: any }) {
-  const emails: string[] = data.emails || []
+  const osintSchema: any = data.osint || {}
+  const orgSchema: any = osintSchema.organization || {}
+  const emails: string[] = osintSchema.emails || data.emails || []
   const dorks: any[] = data.google_dorks || []
   const githubRecon: any[] = data.github_recon || []
   const profiles: any[] = data.behind_the_email || []
   const linkedinIntel: any = data.linkedin_intelligence || {}
   const companyMeta: any = data.company_metadata || {}
-  const publicKnowledge: any = data.public_knowledge || {}
+  const publicKnowledge: any = osintSchema.wikipedia || data.public_knowledge || {}
   const digitalFootprint: any = data.digital_footprint || {}
-  const founders: any[] = data.founders || linkedinIntel.founders || []
-  const employees: any[] = data.employees || linkedinIntel.employees || []
-  const socialProfiles: any[] = data.website_social_profiles || digitalFootprint.all_social_profiles || []
+  const founders: any[] = osintSchema.founders || data.founders || linkedinIntel.founders || []
+  const employees: any[] = osintSchema.employees || data.employees || linkedinIntel.employees || []
+  const socialProfiles: any[] = osintSchema.social_profiles?.all || data.website_social_profiles || digitalFootprint.all_social_profiles || []
   const githubIntel: any = data.github_intelligence || {}
-  const companyName: string = data.company_name || companyMeta.name || data.target || ''
+  const subdomainsCrawled: string[] = osintSchema.subdomains_crawled || data.subdomains_crawled || []
+  const pagesCrawled: string[] = osintSchema.pages_crawled || data.pages_crawled || []
+  const stepErrors: any[] = osintSchema.errors || data.errors || []
+  const searchProviderName: string = osintSchema.search_provider || data.online_search?.search_provider || 'Public Web Fallback'
+  const providerConfigured: boolean = Boolean(osintSchema.provider_configured ?? data.online_search?.provider_configured)
+  const companyName: string = orgSchema.name || data.company_name || companyMeta.name || data.target || ''
   const targetDomain: string = data.target || ''
+  const orgLogo: string | null = orgSchema.logo || companyMeta.logo || linkedinIntel.logo_url || null
+  const orgWebsite: string = orgSchema.website || `https://${targetDomain}`
+  const orgWikipediaUrl: string = orgSchema.wikipedia_url || publicKnowledge.source_url || companyMeta.wikipedia_url || ''
+  const orgWikidataUrl: string = orgSchema.wikidata_url || publicKnowledge.wikidata_url || companyMeta.wikidata_url || (orgSchema.wikidata_id ? `https://www.wikidata.org/wiki/${orgSchema.wikidata_id}` : '')
+  const orgWikidataId: string = orgSchema.wikidata_id || publicKnowledge.wikidata_id || companyMeta.wikidata_id || ''
+  const orgParent: string = orgSchema.parent_company || companyMeta.parent_organization || publicKnowledge.parent_organization || ''
+  const orgRevenue: string = orgSchema.revenue || companyMeta.revenue || publicKnowledge.revenue || ''
+  const orgProducts: string = orgSchema.products || companyMeta.products || publicKnowledge.products || ''
+  const orgSources: string[] = orgSchema.sources || []
+  const reportedEmployeeCount: string = orgSchema.employee_count || linkedinIntel.reported_employee_count || companyMeta.estimated_employees || ''
   const internetIntel: any = (data.internet_intelligence && Object.keys(data.internet_intelligence).length > 0)
     ? data.internet_intelligence
     : buildFallbackInternetIntel(targetDomain, companyName)
@@ -1290,6 +1307,8 @@ function OSINTResultView({ data }: { data: any }) {
     founders.length > 0 ? 'executive' : socialProfiles.length > 0 ? 'socials' : 'employees'
   )
   const [employeeDepartment, setEmployeeDepartment] = useState<string>('All')
+  const [employeeConfidence, setEmployeeConfidence] = useState<string>('ALL')
+  const [employeeSourceFilter, setEmployeeSourceFilter] = useState<string>('ALL')
   const [employeeQuery, setEmployeeQuery] = useState<string>('')
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
 
@@ -1301,16 +1320,38 @@ function OSINTResultView({ data }: { data: any }) {
     setTimeout(() => setCopiedKey(null), 2000)
   }
 
-  // Filter employees
+  const allEmployeeSources: string[] = Array.from(
+    new Set(
+      employees.flatMap((emp: any) =>
+        Array.isArray(emp.sources) && emp.sources.length > 0
+          ? emp.sources
+          : emp.source
+          ? [emp.source]
+          : []
+      )
+    )
+  ).slice(0, 10)
+
+  // Filter employees by department, confidence, source, and search query
   const filteredEmployees = employees.filter((emp: any) => {
     const matchesDept =
       employeeDepartment === 'All' || emp.department === employeeDepartment
+    const empConf = (emp.confidence || 'MEDIUM').toUpperCase()
+    const matchesConf =
+      employeeConfidence === 'ALL' || empConf === employeeConfidence
+    const empSources: string[] = Array.isArray(emp.sources) && emp.sources.length > 0
+      ? emp.sources
+      : emp.source
+      ? [emp.source]
+      : []
+    const matchesSource =
+      employeeSourceFilter === 'ALL' || empSources.includes(employeeSourceFilter)
     const matchesSearch =
       !employeeQuery ||
       (emp.name && emp.name.toLowerCase().includes(employeeQuery.toLowerCase())) ||
       (emp.title && emp.title.toLowerCase().includes(employeeQuery.toLowerCase())) ||
       (emp.email && emp.email.toLowerCase().includes(employeeQuery.toLowerCase()))
-    return matchesDept && matchesSearch
+    return matchesDept && matchesConf && matchesSource && matchesSearch
   })
 
   // Group departments
@@ -1323,7 +1364,7 @@ function OSINTResultView({ data }: { data: any }) {
   return (
     <div className="space-y-6">
 
-      {/* ── Intelligence Command Center Dossier Header ── */}
+      {/* ── Intelligence Command Center Dossier Header (Organization Card) ── */}
       <div className="relative overflow-hidden rounded-2xl border border-surface-700/60 bg-gradient-to-br from-surface-950 via-surface-900 to-surface-950 p-6 shadow-2xl backdrop-blur-xl">
         <div className="absolute -right-12 -top-12 h-64 w-64 rounded-full bg-cyan-500/5 blur-3xl pointer-events-none" />
         <div className="absolute -left-12 -bottom-12 h-64 w-64 rounded-full bg-brand-500/5 blur-3xl pointer-events-none" />
@@ -1331,34 +1372,73 @@ function OSINTResultView({ data }: { data: any }) {
         <div className="relative z-10 space-y-5">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="flex items-center gap-4">
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500/20 via-cyan-500/10 to-blue-500/20 border border-brand-500/30 text-2xl shadow-lg shadow-brand-950/50">
-                🕵️
-              </div>
+              {orgLogo ? (
+                <img
+                  src={orgLogo}
+                  alt={companyName}
+                  className="h-14 w-14 rounded-2xl object-contain bg-white/5 border border-surface-700 p-1.5 shadow-lg flex-shrink-0"
+                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+                />
+              ) : (
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-brand-500/20 via-cyan-500/10 to-blue-500/20 border border-brand-500/30 text-2xl shadow-lg shadow-brand-950/50 flex-shrink-0">
+                  🕵️
+                </div>
+              )}
               <div>
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="text-xl font-bold tracking-tight text-white">{companyName}</h2>
-                  <span className="rounded-lg bg-surface-800/90 px-2.5 py-0.5 font-mono text-xs text-brand-300 border border-surface-700">
-                    {targetDomain}
-                  </span>
+                  <a
+                    href={orgWebsite}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 rounded-lg bg-surface-800/90 px-2.5 py-0.5 font-mono text-xs text-brand-300 border border-surface-700 hover:border-brand-500/50 transition-colors"
+                  >
+                    {targetDomain} <ExternalLink className="h-2.5 w-2.5" />
+                  </a>
                   {companyMeta.json_ld_detected && (
                     <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 border border-emerald-500/20">
                       ✓ Schema.org Verified
                     </span>
                   )}
-                  {(publicKnowledge.source_url || companyMeta.wikipedia_url) && (
+                  {orgWikipediaUrl && (
                     <a
-                      href={publicKnowledge.source_url || companyMeta.wikipedia_url}
+                      href={orgWikipediaUrl}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-2 py-0.5 text-[10px] font-semibold text-blue-300 border border-blue-500/25 hover:bg-blue-500/20 transition-colors"
                     >
-                      🌐 Wikipedia Verified <ExternalLink className="h-2.5 w-2.5" />
+                      🌐 Wikipedia <ExternalLink className="h-2.5 w-2.5" />
+                    </a>
+                  )}
+                  {orgWikidataUrl && (
+                    <a
+                      href={orgWikidataUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-md bg-purple-500/10 px-2 py-0.5 text-[10px] font-semibold text-purple-300 border border-purple-500/25 hover:bg-purple-500/20 transition-colors"
+                    >
+                      🏛️ Wikidata {orgWikidataId || ''} <ExternalLink className="h-2.5 w-2.5" />
                     </a>
                   )}
                 </div>
                 <p className="mt-1 text-xs text-surface-400 max-w-2xl leading-relaxed">
-                  {companyMeta.description || 'Passive open-source intelligence harvested from public website structure, team registries, and verified digital footprints.'}
+                  {orgSchema.description || companyMeta.description || 'Passive open-source intelligence harvested from public website structure, team registries, and verified digital footprints.'}
                 </p>
+                {orgSources.length > 0 && (
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] text-surface-500">Sources:</span>
+                    {orgSources.slice(0, 5).map((src, sIdx) => (
+                      <span key={sIdx} className="rounded bg-surface-900/90 px-1.5 py-0.5 text-[9px] text-surface-400 border border-surface-800 truncate max-w-[180px]">
+                        {src.replace(/^https?:\/\//, '')}
+                      </span>
+                    ))}
+                    {subdomainsCrawled.length > 0 && (
+                      <span className="rounded bg-cyan-500/10 px-1.5 py-0.5 text-[9px] text-cyan-300 border border-cyan-500/20">
+                        {subdomainsCrawled.length} host(s) · {pagesCrawled.length} page(s)
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1371,32 +1451,38 @@ function OSINTResultView({ data }: { data: any }) {
           </div>
 
           {/* Company Profile Metadata Chips */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-2">
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-2.5 pt-2">
             <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Industry & Sector</span>
               <span className="text-xs font-semibold text-white truncate block">
-                {companyMeta.industry || 'Technology & Software'}
+                {orgSchema.industry || companyMeta.industry || 'Technology & Software'}
               </span>
             </div>
             <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Headquarters</span>
               <span className="text-xs font-semibold text-white truncate block flex items-center gap-1">
                 <MapPin className="h-3 w-3 text-red-400 flex-shrink-0" />
-                {companyMeta.headquarters || 'Public Digital Infrastructure'}
+                {orgSchema.hq || companyMeta.headquarters || 'Public Digital Infrastructure'}
               </span>
             </div>
             <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Established</span>
               <span className="text-xs font-semibold text-white flex items-center gap-1">
                 <Calendar className="h-3 w-3 text-brand-400 flex-shrink-0" />
-                {companyMeta.founded_year || 'Verified Domain'}
+                {orgSchema.founded || companyMeta.founded_year || 'Verified Domain'}
               </span>
             </div>
             <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Estimated Team</span>
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Headcount (Reported / Found)</span>
               <span className="text-xs font-semibold text-white flex items-center gap-1">
                 <Users className="h-3 w-3 text-blue-400 flex-shrink-0" />
-                {companyMeta.estimated_employees || `${employees.length || 1}+ Identified`}
+                {reportedEmployeeCount ? `${reportedEmployeeCount} · ` : ''}{employees.length} verified
+              </span>
+            </div>
+            <div className="rounded-xl border border-surface-800/80 bg-surface-900/60 p-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 block mb-0.5">Parent / Revenue</span>
+              <span className="text-xs font-semibold text-white truncate block">
+                {orgParent || orgRevenue || orgProducts || 'Independent Entity'}
               </span>
             </div>
           </div>
@@ -1536,11 +1622,21 @@ function OSINTResultView({ data }: { data: any }) {
               <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-surface-800 text-2xl text-surface-400">
                 🔍
               </div>
-              <div className="space-y-1">
+              <div className="space-y-1.5">
                 <h4 className="text-sm font-bold text-white">No Public Executive Profiles Declared on Target Pages</h4>
-                <p className="text-xs text-surface-400 max-w-md mx-auto leading-relaxed">
-                  The scanned public pages and Wikipedia registries for <span className="text-brand-300 font-mono">{targetDomain}</span> do not explicitly list founder or owner names.
+                <p className="text-xs text-surface-400 max-w-lg mx-auto leading-relaxed">
+                  The scanned pages across <span className="text-brand-300 font-mono">{subdomainsCrawled.join(', ') || targetDomain}</span> and Wikipedia/Wikidata do not explicitly list founder or CEO names.
                 </p>
+                {!providerConfigured && (
+                  <p className="text-[11px] text-amber-300/90 max-w-lg mx-auto">
+                    Reason: Dedicated search API provider is not configured (currently using {searchProviderName}). Configure BRAVE_API_KEY, SERPAPI_KEY, or BING_SEARCH_API_KEY for deeper LinkedIn executive discovery.
+                  </p>
+                )}
+                {stepErrors.length > 0 && (
+                  <p className="text-[11px] text-surface-500 max-w-lg mx-auto">
+                    Diagnostics: {stepErrors.map((er: any) => `${er.step}: ${er.reason}`).slice(0, 2).join(' · ')}
+                  </p>
+                )}
               </div>
               <button
                 onClick={() => setActiveTab('recon_tools')}
@@ -1558,8 +1654,15 @@ function OSINTResultView({ data }: { data: any }) {
                   : 'LE'
                 const hasDirectLinkedIn = Boolean(founder.linkedin_url && founder.linkedin_url.includes('linkedin.com/in/'))
                 const inferredEmail = founder.inferred_email || `${founder.name?.toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '')}@${targetDomain}`
-                const photoUrl = founder.photo_url || founder.avatar_url || founder.photo || founder.avatar
+                const photoUrl = founder.image_url || founder.photo_url || founder.avatar_url || founder.photo || founder.avatar
                 const bioSummary = founder.bio_summary || founder.bio || ''
+                const founderConf = (founder.confidence || 'HIGH').toUpperCase()
+                const founderSources: string[] = Array.isArray(founder.sources) && founder.sources.length > 0
+                  ? founder.sources
+                  : founder.source
+                  ? [founder.source]
+                  : ['Website Team Page']
+                const founderSentence = founder.source_sentence || ''
                 const biography: Record<string, string> = { ...(founder.biography || {}) }
                 const sourceRefs: any[] = (founder.source_references && founder.source_references.length > 0)
                   ? founder.source_references
@@ -1635,9 +1738,20 @@ function OSINTResultView({ data }: { data: any }) {
                             </p>
                           </div>
 
-                          <div className="inline-flex items-center gap-1.5 bg-emerald-500/15 border border-emerald-500/25 rounded-full px-3 py-1">
-                            <svg className="h-4 w-4 text-emerald-400" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
-                            <span className="text-xs font-semibold text-emerald-300">Public-source profile</span>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="inline-flex items-center gap-1.5 bg-emerald-500/15 border border-emerald-500/25 rounded-full px-3 py-1">
+                              <svg className="h-4 w-4 text-emerald-400" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
+                              <span className="text-xs font-semibold text-emerald-300">Public-source profile</span>
+                            </div>
+                            <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold border ${
+                              founderConf === 'HIGH'
+                                ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                                : founderConf === 'MEDIUM'
+                                ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                : 'bg-surface-800 text-surface-300 border-surface-700'
+                            }`}>
+                              {founderConf} Confidence
+                            </span>
                           </div>
 
                           {bioSummary && (
@@ -1645,13 +1759,20 @@ function OSINTResultView({ data }: { data: any }) {
                               {bioSummary}
                             </p>
                           )}
+                          {founderSentence && founderSentence !== bioSummary && (
+                            <p className="text-[11px] italic text-surface-400 border-l-2 border-brand-500/40 pl-2.5">
+                              “{founderSentence.slice(0, 180)}”
+                            </p>
+                          )}
 
-                          <div className="flex flex-wrap items-center gap-2 pt-0.5">
-                            <span className="text-[10px] text-surface-500">
-                              Source: {founder.source || 'Website Team Page'}
-                            </span>
+                          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                            {founderSources.map((srcLabel: string, srcIdx: number) => (
+                              <span key={srcIdx} className="rounded-md bg-surface-800/90 px-2 py-0.5 text-[10px] font-medium text-surface-300 border border-surface-700">
+                                {srcLabel}
+                              </span>
+                            ))}
                             {founder.department && (
-                              <span className="rounded-md bg-surface-800 px-2 py-0.5 text-[9px] font-medium text-surface-300 border border-surface-700">
+                              <span className="rounded-md bg-brand-500/10 px-2 py-0.5 text-[9px] font-medium text-brand-300 border border-brand-500/20">
                                 {founder.department}
                               </span>
                             )}
@@ -1741,6 +1862,26 @@ function OSINTResultView({ data }: { data: any }) {
                               className="inline-flex items-center gap-2 rounded-lg bg-surface-800 border border-surface-700 px-3 py-1.5 text-[11px] font-semibold text-surface-300 hover:bg-surface-700 transition-colors"
                             >
                               <span>🔍</span> LinkedIn Search
+                            </a>
+                          )}
+                          {founder.twitter_url && (
+                            <a
+                              href={founder.twitter_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-sky-500/15 border border-sky-500/25 px-3 py-1.5 text-[11px] font-semibold text-sky-300 hover:bg-sky-500/25 transition-colors"
+                            >
+                              <span>𝕏</span> Twitter / X
+                            </a>
+                          )}
+                          {founder.github_url && (
+                            <a
+                              href={founder.github_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-surface-800 border border-surface-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-surface-700 transition-colors"
+                            >
+                              <span>🐙</span> GitHub
                             </a>
                           )}
                         </div>
@@ -1881,42 +2022,91 @@ function OSINTResultView({ data }: { data: any }) {
             </div>
           </div>
 
-          {/* Department Filter & Search Controls */}
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-surface-900/60 p-3 border border-surface-800">
-            <div className="flex flex-wrap gap-1.5">
-              {['All', 'Executive Leadership', 'Engineering & Tech', 'Cybersecurity & IT', 'Operations & Business'].map((dept) => {
-                const count = dept === 'All' ? employees.length : (departmentCounts[dept] || 0)
-                return (
-                  <button
-                    key={dept}
-                    onClick={() => setEmployeeDepartment(dept)}
-                    className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
-                      employeeDepartment === dept
-                        ? 'bg-brand-600 text-white shadow-md shadow-brand-900/40'
-                        : 'bg-surface-800/80 text-surface-400 hover:text-white border border-surface-700/60'
-                    }`}
-                  >
-                    {dept} ({count})
-                  </button>
-                )
-              })}
+          {/* Department, Confidence, Source Filter & Search Controls */}
+          <div className="space-y-2.5 rounded-xl bg-surface-900/60 p-3 border border-surface-800">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap gap-1.5">
+                {['All', 'Executive Leadership', 'Engineering & Tech', 'Cybersecurity & IT', 'Operations & Business'].map((dept) => {
+                  const count = dept === 'All' ? employees.length : (departmentCounts[dept] || 0)
+                  return (
+                    <button
+                      key={dept}
+                      onClick={() => setEmployeeDepartment(dept)}
+                      className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                        employeeDepartment === dept
+                          ? 'bg-brand-600 text-white shadow-md shadow-brand-900/40'
+                          : 'bg-surface-800/80 text-surface-400 hover:text-white border border-surface-700/60'
+                      }`}
+                    >
+                      {dept} ({count})
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="relative min-w-[220px] flex-1 sm:flex-initial">
+                <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-surface-500" />
+                <input
+                  type="text"
+                  placeholder="Search staff by name or role..."
+                  value={employeeQuery}
+                  onChange={(e) => setEmployeeQuery(e.target.value)}
+                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-surface-950 border border-surface-800 rounded-lg text-white placeholder-surface-500 focus:outline-none focus:border-brand-500"
+                />
+              </div>
             </div>
 
-            <div className="relative min-w-[220px] flex-1 sm:flex-initial">
-              <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-surface-500" />
-              <input
-                type="text"
-                placeholder="Search staff by name or role..."
-                value={employeeQuery}
-                onChange={(e) => setEmployeeQuery(e.target.value)}
-                className="w-full pl-9 pr-3 py-1.5 text-xs bg-surface-950 border border-surface-800 rounded-lg text-white placeholder-surface-500 focus:outline-none focus:border-brand-500"
-              />
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-surface-800/70">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-surface-500 mr-1">Confidence:</span>
+                {['ALL', 'HIGH', 'MEDIUM', 'LOW'].map((conf) => (
+                  <button
+                    key={conf}
+                    onClick={() => setEmployeeConfidence(conf)}
+                    className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition-all ${
+                      employeeConfidence === conf
+                        ? 'bg-cyan-600/30 text-cyan-200 border-cyan-500/40'
+                        : 'bg-surface-950 text-surface-400 border-surface-800 hover:text-white'
+                    }`}
+                  >
+                    {conf}
+                  </button>
+                ))}
+              </div>
+
+              {allEmployeeSources.length > 0 && (
+                <select
+                  aria-label="Filter employees by source"
+                  value={employeeSourceFilter}
+                  onChange={(e) => setEmployeeSourceFilter(e.target.value)}
+                  className="px-2.5 py-1 text-[11px] bg-surface-950 border border-surface-800 rounded-lg text-surface-300 focus:outline-none focus:border-brand-500"
+                >
+                  <option value="ALL">All Sources ({allEmployeeSources.length})</option>
+                  {allEmployeeSources.map((src) => (
+                    <option key={src} value={src}>{src}</option>
+                  ))}
+                </select>
+              )}
             </div>
           </div>
 
           {filteredEmployees.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-surface-800 bg-surface-900/30 p-8 text-center text-xs text-surface-500">
-              No personnel matched the current filter criteria.
+            <div className="rounded-2xl border border-dashed border-surface-800 bg-surface-900/30 p-8 text-center space-y-2">
+              <p className="text-xs font-semibold text-surface-300">
+                {employees.length === 0
+                  ? 'No public employee directory records discovered.'
+                  : 'No personnel matched the current filter criteria.'}
+              </p>
+              {employees.length === 0 && !providerConfigured && (
+                <p className="text-[11px] text-amber-300/90 max-w-lg mx-auto">
+                  LinkedIn search provider not configured (using {searchProviderName}). Add BRAVE_API_KEY, SERPAPI_KEY, or BING_SEARCH_API_KEY in backend settings to expand LinkedIn staff discovery.
+                </p>
+              )}
+              {employees.length === 0 && stepErrors.length > 0 && (
+                <p className="text-[11px] text-surface-500 max-w-lg mx-auto">
+                  {stepErrors.map((er: any) => `${er.step}: ${er.reason}`).slice(0, 2).join(' · ')}
+                </p>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3.5">
@@ -1926,7 +2116,19 @@ function OSINTResultView({ data }: { data: any }) {
                   : 'EM'
                 const isLeader = emp.department === 'Executive Leadership'
                 const isSec = emp.department === 'Cybersecurity & IT'
-                const empEmail = emp.inferred_email || emp.email || `${emp.name?.toLowerCase().replace(/\s+/g, '.')}@${targetDomain}`
+                const empEmail = emp.email || emp.inferred_email || `${emp.name?.toLowerCase().replace(/\s+/g, '.')}@${targetDomain}`
+                const empPhoto = emp.image_url || emp.avatar_url || emp.photo_url
+                const empConf = (emp.confidence || 'MEDIUM').toUpperCase()
+                const empSources: string[] = Array.isArray(emp.sources) && emp.sources.length > 0
+                  ? emp.sources
+                  : emp.source
+                  ? [emp.source]
+                  : ['Public Footprint']
+                const sourceRefUrl =
+                  (Array.isArray(emp.source_references) && emp.source_references[0]?.url) ||
+                  emp.linkedin_url ||
+                  `https://${targetDomain}`
+                const tooltipText = `Verified via ${empSources.join(', ')} — Evidence URL: ${sourceRefUrl}`
 
                 return (
                   <div
@@ -1934,9 +2136,9 @@ function OSINTResultView({ data }: { data: any }) {
                     className="rounded-2xl border border-surface-800 bg-surface-900/70 p-4 flex flex-col justify-between space-y-3 hover:border-surface-700 transition-all shadow-md"
                   >
                     <div className="flex items-start gap-3">
-                      {emp.avatar_url ? (
+                      {empPhoto ? (
                         <img
-                          src={emp.avatar_url}
+                          src={empPhoto}
                           alt={emp.name}
                           className="h-11 w-11 rounded-xl object-cover border border-surface-700 bg-surface-950 flex-shrink-0"
                           onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
@@ -1954,14 +2156,54 @@ function OSINTResultView({ data }: { data: any }) {
                       )}
 
                       <div className="min-w-0 flex-1">
-                        <h4 className="text-xs font-bold text-white truncate">{emp.name}</h4>
+                        <div className="flex items-center justify-between gap-1">
+                          <h4 className="text-xs font-bold text-white truncate">{emp.name}</h4>
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[9px] font-bold border flex-shrink-0 ${
+                              empConf === 'HIGH'
+                                ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/25'
+                                : empConf === 'MEDIUM'
+                                ? 'bg-amber-500/10 text-amber-300 border-amber-500/25'
+                                : 'bg-surface-800 text-surface-400 border-surface-700'
+                            }`}
+                          >
+                            {empConf}
+                          </span>
+                        </div>
                         <span className="text-[11px] text-surface-300 truncate block mt-0.5">
                           {emp.title}
                         </span>
-                        <div className="flex items-center gap-1.5 mt-1">
+                        <div className="flex flex-wrap items-center gap-1 mt-1">
                           <span className="rounded bg-surface-800 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-surface-400 border border-surface-700">
                             {emp.department}
                           </span>
+                          {emp.location && (
+                            <span className="text-[9px] text-surface-400 truncate max-w-[110px]">
+                              📍 {emp.location}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Source Badges & "Why this result?" Tooltip */}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {empSources.slice(0, 2).map((sLabel: string, sIdx: number) => (
+                        <span key={sIdx} className="rounded bg-surface-950 px-1.5 py-0.5 text-[9px] text-surface-400 border border-surface-800 truncate max-w-[130px]">
+                          {sLabel}
+                        </span>
+                      ))}
+                      <div className="relative group inline-flex items-center ml-auto">
+                        <span
+                          title={tooltipText}
+                          className="cursor-help text-[9px] font-semibold text-cyan-400 hover:text-cyan-300 underline decoration-dotted"
+                        >
+                          Why this result?
+                        </span>
+                        <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity absolute right-0 bottom-5 z-20 w-56 rounded-lg border border-surface-700 bg-surface-950 p-2 text-[10px] text-surface-200 shadow-xl">
+                          <div className="font-semibold text-cyan-300 mb-0.5">Source Provenance</div>
+                          <div className="truncate text-surface-400">Via: {empSources.join(', ')}</div>
+                          <div className="truncate text-brand-300 font-mono mt-0.5">{sourceRefUrl}</div>
                         </div>
                       </div>
                     </div>
@@ -1978,9 +2220,14 @@ function OSINTResultView({ data }: { data: any }) {
                     </div>
 
                     <div className="pt-2 border-t border-surface-800/80 flex items-center justify-between text-[11px]">
-                      <span className="text-[10px] text-surface-500 truncate max-w-[130px]">
-                        {emp.source || 'Public Footprint'}
-                      </span>
+                      <a
+                        href={sourceRefUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[10px] text-surface-500 hover:text-surface-300 truncate max-w-[130px]"
+                      >
+                        {empSources[0]}
+                      </a>
                       {emp.linkedin_url ? (
                         <a
                           href={emp.linkedin_url}

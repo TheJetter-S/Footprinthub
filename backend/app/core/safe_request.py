@@ -171,5 +171,9 @@ async def safe_request(
                 raise SSRFError(
                     f"Response too large: {content_length} bytes (limit: {max_size})"
                 )
+            if response.content is not None and len(response.content) > max_size:
+                raise SSRFError(
+                    f"Response body too large: {len(response.content)} bytes (limit: {max_size})"
+                )
 
         return response
