@@ -635,9 +635,9 @@ class OSINTModule(BaseModule):
             active_scheme = "https"
             for probe_host in [clean_target, base_domain]:
                 try:
-                    resp = await client.get(f"https://{probe_host}/", timeout=5.0)
+                    resp = await client.get(f"https://{probe_host}/", timeout=6.0)
                     if resp.status_code == 200 and resp.text:
-                        homepage_html = resp.text[:400000]
+                        homepage_html = resp.text[:1500000]
                         active_host = urllib.parse.urlparse(str(resp.url)).netloc or probe_host
                         active_scheme = "https"
                         all_crawled_html += homepage_html + "\n"
@@ -647,9 +647,9 @@ class OSINTModule(BaseModule):
             if not homepage_html:
                 for probe_host in [clean_target, base_domain]:
                     try:
-                        resp = await client.get(f"http://{probe_host}/", timeout=5.0)
+                        resp = await client.get(f"http://{probe_host}/", timeout=6.0)
                         if resp.status_code == 200 and resp.text:
-                            homepage_html = resp.text[:400000]
+                            homepage_html = resp.text[:1500000]
                             active_host = urllib.parse.urlparse(str(resp.url)).netloc or probe_host
                             active_scheme = "http"
                             all_crawled_html += homepage_html + "\n"
@@ -700,16 +700,22 @@ class OSINTModule(BaseModule):
 
             # Put dynamically discovered paths BEFORE generic guesses; limit total sub-pages for speed
             merged_paths = discovered_paths + [p for p in paths_to_crawl if p not in discovered_paths]
-            remaining_paths = [p for p in dict.fromkeys(merged_paths) if p not in ("", "/")][:12]
+            remaining_paths = [p for p in dict.fromkeys(merged_paths) if p not in ("", "/")][:14]
+
+            crawl_sem = asyncio.Semaphore(6)
 
             async def _crawl_path(path: str) -> str:
-                try:
-                    url = f"{active_scheme}://{active_host}{path}"
-                    resp = await client.get(url, timeout=3.2)
-                    if resp.status_code == 200 and resp.text:
-                        return resp.text[:250000]
-                except Exception:
-                    pass
+                async with crawl_sem:
+                    for attempt in range(2):
+                        try:
+                            url = f"{active_scheme}://{active_host}{path}"
+                            resp = await client.get(url, timeout=5.0)
+                            if resp.status_code == 200 and resp.text:
+                                return resp.text[:500000]
+                            break
+                        except Exception:
+                            if attempt == 0:
+                                await asyncio.sleep(0.25)
                 return ""
 
             if remaining_paths:
@@ -772,22 +778,31 @@ class OSINTModule(BaseModule):
                         seen_js_urls.add(js_url)
                         entry_js_candidates.append(js_url)
 
+                js_sem = asyncio.Semaphore(6)
+
                 async def _fetch_js(url: str) -> tuple[str, str]:
-                    try:
-                        r = await client.get(url, timeout=4.0)
-                        if r.status_code == 200 and r.text:
-                            return (url, r.text[:800000])
-                    except Exception:
-                        pass
+                    async with js_sem:
+                        for attempt in range(2):
+                            try:
+                                r = await client.get(url, timeout=6.0)
+                                if r.status_code == 200 and r.text:
+                                    return (url, r.text[:1200000])
+                                break
+                            except Exception:
+                                if attempt == 0:
+                                    await asyncio.sleep(0.3)
                     return (url, "")
 
                 if entry_js_candidates:
-                    entry_results = await asyncio.gather(*[_fetch_js(u) for u in entry_js_candidates[:6]])
-                    lazy_chunk_candidates: list[str] = []
-                    high_signal_kw = (
-                        "about", "team", "leader", "founder", "people", "contact",
-                        "company", "story", "footer", "header", "social", "office",
-                        "privacy", "legal", "who", "executive", "management", "overview",
+                    entry_results = await asyncio.gather(*[_fetch_js(u) for u in entry_js_candidates[:8]])
+                    tier1_chunks: list[str] = []
+                    tier2_chunks: list[str] = []
+                    tier1_kw = (
+                        "about", "team", "leader", "founder", "people", "executive",
+                        "management", "who", "company", "contact", "story",
+                    )
+                    tier2_kw = (
+                        "footer", "header", "social", "office", "privacy", "legal", "overview",
                     )
                     for base_js_url, js_body in entry_results:
                         if not js_body:
@@ -803,12 +818,18 @@ class OSINTModule(BaseModule):
                                 ch_url = f"{active_scheme}://{active_host}{ch_ref}"
                             else:
                                 ch_url = f"{active_scheme}://{active_host}/{ch_ref}"
-                            if ch_url not in seen_js_urls and any(kw in ch_ref.lower() for kw in high_signal_kw):
-                                seen_js_urls.add(ch_url)
-                                lazy_chunk_candidates.append(ch_url)
+                            ch_low = ch_ref.lower()
+                            if ch_url not in seen_js_urls:
+                                if any(kw in ch_low for kw in tier1_kw):
+                                    seen_js_urls.add(ch_url)
+                                    tier1_chunks.append(ch_url)
+                                elif any(kw in ch_low for kw in tier2_kw):
+                                    seen_js_urls.add(ch_url)
+                                    tier2_chunks.append(ch_url)
 
+                    lazy_chunk_candidates = tier1_chunks + tier2_chunks
                     if lazy_chunk_candidates:
-                        chunk_results = await asyncio.gather(*[_fetch_js(u) for u in lazy_chunk_candidates[:12]])
+                        chunk_results = await asyncio.gather(*[_fetch_js(u) for u in lazy_chunk_candidates[:18]])
                         for _, ch_body in chunk_results:
                             if ch_body:
                                 crawled_js_list.append(ch_body)

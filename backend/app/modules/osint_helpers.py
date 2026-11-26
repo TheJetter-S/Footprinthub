@@ -924,7 +924,7 @@ class CompanyMetadataScraper:
         except Exception:
             pass
         # Cap BeautifulSoup DOM size (homepage + priority about/team pages come first) to prevent >10s CPU stalls
-        soup_html = html_clean[:1_500_000] if len(html_clean) > 1_500_000 else html_clean
+        soup_html = html_clean[:2_500_000] if len(html_clean) > 2_500_000 else html_clean
         soup = BeautifulSoup(soup_html, "html.parser")
 
         js_list = list(js_bundles or [])
@@ -2174,7 +2174,20 @@ class PublicKnowledgeHarvester:
                 resp = await client.get(
                     f"https://search.yahoo.com/search?p={urllib.parse.quote(q_str)}",
                     headers=headers,
-                    timeout=6.0,
+                    timeout=5.5,
+                )
+                if resp.status_code == 200 and resp.text:
+                    return resp.text
+            except Exception:
+                pass
+            return ""
+
+        async def _query_google_news(q_str: str) -> str:
+            try:
+                resp = await client.get(
+                    f"https://news.google.com/rss/search?q={urllib.parse.quote(q_str)}&hl=en-US&gl=US&ceid=US:en",
+                    headers=headers,
+                    timeout=5.5,
                 )
                 if resp.status_code == 200 and resp.text:
                     return resp.text
@@ -2183,8 +2196,11 @@ class PublicKnowledgeHarvester:
             return ""
 
         try:
-            pages = await asyncio.gather(*[_query_yahoo(q) for q in queries])
-            for html_body in pages:
+            yahoo_pages, gnews_xml = await asyncio.gather(
+                asyncio.gather(*[_query_yahoo(q) for q in queries]),
+                _query_google_news(f'"{company_name}" founder OR CEO'),
+            )
+            for html_body in yahoo_pages:
                 if not html_body:
                     continue
                 soup = BeautifulSoup(html_body, "html.parser")
@@ -2305,6 +2321,71 @@ class PublicKnowledgeHarvester:
                                         "is_verified": True,
                                         "is_founder": True,
                                     })
+
+            # 5. Parse Google News RSS items for press/news founder mentions (works reliably even if web search limits)
+            if gnews_xml and "<item>" in gnews_xml:
+                import xml.etree.ElementTree as ET
+                root_el = ET.fromstring(gnews_xml)
+                for item_el in root_el.findall(".//item")[:10]:
+                    t_el = item_el.find("title")
+                    l_el = item_el.find("link")
+                    d_el = item_el.find("description")
+                    item_title = (t_el.text or "").strip() if t_el is not None else ""
+                    raw_desc = (d_el.text or "").strip() if d_el is not None else ""
+                    item_desc = re.sub(r"<[^>]+>", " ", html.unescape(raw_desc)).strip() if raw_desc else ""
+                    item_url = (l_el.text or "").strip() if l_el is not None else ""
+                    item_txt = f"{item_title} {item_desc}"
+                    item_low = item_txt.lower()
+                    if not (
+                        clean_domain in item_low
+                        or (len(comp_low) >= 4 and comp_low in item_low)
+                        or (len(domain_root) >= 4 and domain_root in item_low)
+                    ):
+                        continue
+                    if item_title and len(out["search_snippets"]) < 6:
+                        out["search_snippets"].append({"title": item_title, "url": item_url, "snippet": item_desc[:280]})
+
+                    for gm in re.finditer(
+                        rf"(?:{re.escape(company_name)}|{re.escape(domain_root)})(?:'s|’s)?\s+(?:(Co-?\s*Founder(?:\s*(?:&|and)\s*CEO)?|Founder(?:\s*(?:&|and)\s*CEO)?|CEO))\s+([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z.'-]{{1,15}}){{1,2}})",
+                        item_txt,
+                    ):
+                        g_role, g_name = _norm_role(gm.group(1)), gm.group(2).strip()
+                        nk = g_name.lower()
+                        if nk not in seen_founder_names and not any(b in nk for b in ("the ", "and ", "says", "said", "announces", "launches")):
+                            seen_founder_names.add(nk)
+                            out["founders"].append({
+                                "name": g_name,
+                                "title": g_role,
+                                "department": "Executive Leadership",
+                                "linkedin_url": "",
+                                "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(g_name + ' ' + company_name)}",
+                                "bio": item_desc[:260] or item_title,
+                                "source": "Online News & Press Search",
+                                "source_references": [{"name": item_title[:60], "url": item_url, "icon": "📰"}],
+                                "is_verified": True,
+                                "is_founder": True,
+                            })
+                    for gm2 in re.finditer(
+                        r"([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z.'-]{1,15}){1,2}),\s+(Co-?\s*Founder(?:\s*(?:&|and)\s*CEO)?|Founder(?:\s*(?:&|and)\s*CEO)?|Chief Executive Officer|CEO)\s+(?:of|at)\s+([A-Za-z0-9 .&-]{2,35})",
+                        item_txt,
+                    ):
+                        g_name, g_role, g_comp = gm2.group(1).strip(), _norm_role(gm2.group(2)), gm2.group(3).lower()
+                        if comp_low in g_comp or domain_root in g_comp:
+                            nk = g_name.lower()
+                            if nk not in seen_founder_names:
+                                seen_founder_names.add(nk)
+                                out["founders"].append({
+                                    "name": g_name,
+                                    "title": g_role,
+                                    "department": "Executive Leadership",
+                                    "linkedin_url": "",
+                                    "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(g_name + ' ' + company_name)}",
+                                    "bio": item_desc[:260] or item_title,
+                                    "source": "Online News & Press Search",
+                                    "source_references": [{"name": item_title[:60], "url": item_url, "icon": "📰"}],
+                                    "is_verified": True,
+                                    "is_founder": True,
+                                })
         except Exception:
             pass
         finally:
