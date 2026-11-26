@@ -372,7 +372,11 @@ class ContactMetadataExtractor:
     )
 
     @classmethod
-    def extract_phone_numbers(cls, html_text: str) -> list[dict[str, str]]:
+    def extract_phone_numbers(
+        cls,
+        html_text: str,
+        plain_text: Optional[str] = None,
+    ) -> list[dict[str, str]]:
         phones = []
         seen = set()
         for m in re.finditer(r'href=[\'"]tel:([^\'"]+)[\'"]', html_text, re.IGNORECASE):
@@ -382,8 +386,11 @@ class ContactMetadataExtractor:
                 seen.add(clean)
                 phones.append({"number": raw, "type": "tel_link"})
 
-        soup = BeautifulSoup(html_text, "html.parser")
-        text = soup.get_text(separator=" ")
+        if plain_text is None:
+            soup = BeautifulSoup(html_text, "html.parser")
+            text = soup.get_text(separator=" ")
+        else:
+            text = plain_text
         for match in cls.PHONE_REGEX.finditer(text):
             num = match.group(0).strip()
             digits = re.sub(r"\D", "", num)
@@ -393,9 +400,14 @@ class ContactMetadataExtractor:
         return phones
 
     @classmethod
-    def extract_physical_addresses(cls, html_text: str) -> list[dict[str, Any] | str]:
+    def extract_physical_addresses(
+        cls,
+        html_text: str,
+        soup: Optional[Any] = None,
+    ) -> list[dict[str, Any] | str]:
         addresses = []
-        soup = BeautifulSoup(html_text, "html.parser")
+        if soup is None:
+            soup = BeautifulSoup(html_text, "html.parser")
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.string or "")
@@ -911,11 +923,31 @@ class CompanyMetadataScraper:
             html_clean = html.unescape(html_clean)
         except Exception:
             pass
-        soup = BeautifulSoup(html_clean, "html.parser")
+        # Cap BeautifulSoup DOM size (homepage + priority about/team pages come first) to prevent >10s CPU stalls
+        soup_html = html_clean[:1_500_000] if len(html_clean) > 1_500_000 else html_clean
+        soup = BeautifulSoup(soup_html, "html.parser")
 
-        js_intel = cls._extract_js_intelligence(js_bundles or [], domain, company_name=company_name)
+        js_list = list(js_bundles or [])
+        ld_json_scripts: list[str] = []
+        # Extract unescaped Next.js RSC / __NEXT_DATA__ payloads and JSON-LD scripts BEFORE decomposing <script>
+        for sc in soup.find_all("script"):
+            sc_type = str(sc.get("type") or "").lower()
+            sc_txt = sc.string or sc.get_text() or ""
+            if "ld+json" in sc_type and sc_txt:
+                ld_json_scripts.append(sc_txt)
+            if len(sc_txt) > 100 and any(marker in sc_txt for marker in ("__next_f", "__NEXT_DATA__", "__NUXT__", "__remixContext")):
+                js_list.append(sc_txt.replace(r'\"', '"').replace(r"\/", "/"))
+
+        # Extract physical addresses before decomposing <script type="application/ld+json">
+        pre_addresses = ContactMetadataExtractor.extract_physical_addresses(soup_html, soup=soup)
+
+        js_intel = cls._extract_js_intelligence(js_list, domain, company_name=company_name)
         js_prose = js_intel.get("prose_text", "")
-        combined_readable = html_clean + ("\n" + js_prose if js_prose else "")
+        # Extract clean block-separated visible text and strip script/style/svg once (avoids re-parsing multi-MB HTML)
+        for tag in soup(["script", "style", "noscript", "svg"]):
+            tag.decompose()
+        plain_html_text = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
+        combined_readable = plain_html_text + ("\n" + js_prose if js_prose else "")
 
         meta: dict[str, Any] = {
             "name": company_name,
@@ -935,18 +967,18 @@ class CompanyMetadataScraper:
             "addresses": list(js_intel.get("addresses", [])),
         }
 
-        # Extract phone numbers from tel: links, JS tel: links, and on-page patterns
+        # Extract phone numbers from tel: links, JS tel: links, and on-page patterns (reusing plain_html_text)
         for p_num in js_intel.get("phones", []):
             if p_num and p_num not in meta["phone_numbers"]:
                 meta["phone_numbers"].append(p_num)
-        extracted_phones = ContactMetadataExtractor.extract_phone_numbers(html_clean)
+        extracted_phones = ContactMetadataExtractor.extract_phone_numbers(html_clean, plain_text=plain_html_text)
         for p in extracted_phones:
             p_num = p["number"]
             if p_num and p_num not in meta["phone_numbers"]:
                 meta["phone_numbers"].append(p_num)
 
-        # Extract physical addresses
-        for addr_item in ContactMetadataExtractor.extract_physical_addresses(html_clean):
+        # Merge pre-extracted physical addresses
+        for addr_item in pre_addresses:
             if addr_item not in meta["addresses"]:
                 meta["addresses"].append(addr_item)
         if meta["addresses"] and not meta["headquarters"]:
@@ -994,9 +1026,8 @@ class CompanyMetadataScraper:
                     break
 
         # 2. Schema.org JSON-LD parsing (with @graph support & Person parsing)
-        for script in soup.find_all("script", type="application/ld+json"):
+        for raw_json in ld_json_scripts:
             try:
-                raw_json = script.string or script.get_text()
                 if not raw_json:
                     continue
                 data = json.loads(raw_json)
@@ -1194,6 +1225,8 @@ class CompanyMetadataScraper:
         ) -> None:
             if not name:
                 return
+            if "'s" in name or "’s" in name:
+                return
             clean_n = re.sub(r"^(?:Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.)\s+", "", name.strip(), flags=re.I)
             clean_n = re.sub(r"[,;:\-].*$", "", clean_n).strip()
             parts = clean_n.split()
@@ -1204,8 +1237,10 @@ class CompanyMetadataScraper:
                 "founder", "founders", "ceo", "president", "management", "and", "best", "top",
                 "enterprise", "solutions", "software", "platform", "cloud", "services", "technologies",
                 "corporation", "review", "award", "products", "customers", "partners", "global", "leading",
+                "meet", "about", "learn", "read", "view", "see", "discover", "join", "visit", "explore",
+                "contact", "trusted", "why", "how", "build", "secure", "get", "start", "request", "postmans",
             }
-            if any(p.lower() in stop for p in parts):
+            if any(p.lower().rstrip("'s’") in stop for p in parts):
                 return
             norm_name = " ".join([p.capitalize() if p.islower() else p for p in parts])
             key = _norm_key(norm_name)
@@ -1497,7 +1532,36 @@ class CompanyMetadataScraper:
                     if child.find(["h2", "h3", "h4", "h5", "strong"]) and (child.find("img") or child.find(["p", "span"])):
                         candidate_cards.append(child)
 
-        for card in candidate_cards[:50]:
+        # 7b. Generic Tailwind/Bootstrap/Webflow DOM card heuristic (when cards use utility classes instead of 'team-card')
+        seen_card_elems: set[int] = {id(c) for c in candidate_cards}
+        role_hint_re = re.compile(
+            r"\b((?:Co-)?Founder|CEO|Chief Executive Officer|CTO|Chief Technology Officer|COO|Chief Operating Officer|CFO|Chief Financial Officer|CISO|Managing Director|President|VP|Vice President|Head of [A-Za-z &]{2,30}|Director of [A-Za-z &]{2,30}|(?:HR|Engineering|Security) Director)\b",
+            re.I,
+        )
+        for role_el in soup.find_all(["p", "span", "div", "h4", "h5", "h6", "small"]):
+            r_txt = role_el.get_text(" ", strip=True)
+            if not r_txt or len(r_txt.split()) > 10 or len(r_txt) > 80:
+                continue
+            if not role_hint_re.search(r_txt):
+                continue
+            card_cand = role_el.find_parent(["div", "article", "li", "section"])
+            if not card_cand or id(card_cand) in seen_card_elems:
+                continue
+            # Ignore oversized layout wrappers or testimonial blockquotes
+            full_card_txt = card_cand.get_text(" ", strip=True)
+            if len(full_card_txt.split()) > 160 or card_cand.find("blockquote"):
+                continue
+            card_cls_str = " ".join(card_cand.get("class") or []).lower()
+            if any(bad in card_cls_str for bad in ["testimonial", "quote", "review", "case-study"]):
+                continue
+            heading_el = card_cand.find(["h2", "h3", "h4", "h5", "strong"])
+            if heading_el and heading_el != role_el:
+                h_txt = heading_el.get_text(" ", strip=True)
+                if 2 <= len(h_txt.split()) <= 4 and all(re.match(r"^[A-Z][a-zA-Z.'-]*$", w) for w in h_txt.split()):
+                    seen_card_elems.add(id(card_cand))
+                    candidate_cards.append(card_cand)
+
+        for card in candidate_cards[:60]:
             h = card.find(class_=re.compile(r"name", re.I)) or card.find(["h3", "h4", "h5", "h2", "strong"])
             if not h:
                 continue
@@ -1576,6 +1640,8 @@ class CompanyMetadataScraper:
                                 f["bio_summary"] = bio
                             if c_li_link and not f.get("linkedin_url"):
                                 f["linkedin_url"] = c_li_link
+                            if c_title and f.get("title") in ("Founder", "Co-Founder", "Key Personnel", "Team Member") and len(c_title) > len(f.get("title", "")):
+                                f["title"] = re.sub(r"\b(Ceo|Cto|Coo|Cfo|Ciso|Vp|Hr)\b", lambda m: m.group(1).upper(), c_title.strip())
             else:
                 if c_key not in seen_names:
                     seen_names.add(c_key)
@@ -1596,7 +1662,7 @@ class CompanyMetadataScraper:
                     meta["scraped_team"].append(card_person)
 
         # 8. Direct regex search for any remaining LinkedIn personal profiles in HTML or JS bundles
-        raw_li_corpus = html_clean + ("\n" + "\n".join(js_bundles) if js_bundles else "")
+        raw_li_corpus = html_clean + ("\n" + "\n".join(js_list) if js_list else "")
         raw_in_matches = re.findall(r'https?://(?:[a-z0-9-]+\.)?linkedin\.com/in/([a-zA-Z0-9_.-]+)', raw_li_corpus, re.I)
         for slug in raw_in_matches:
             slug = slug.rstrip("/")
@@ -1657,6 +1723,8 @@ class PublicKnowledgeHarvester:
         domain_root = clean_domain.split(".")[0]
         raw_queries = [
             legal_name,
+            f"{company_name} (company)",
+            f"{company_name} (software)",
             company_name,
             f"{company_name} Corporation",
             f"{company_name} Inc.",
@@ -1679,206 +1747,350 @@ class PublicKnowledgeHarvester:
             "source_url": "",
             "wikidata_id": "",
             "wikipedia_status": "not_listed",
-            "searched_queries": queries[:5],
+            "searched_queries": queries[:6],
             "candidate_slugs": [],
         }
 
         should_close = False
         if not client:
-            client = httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=headers)
+            client = httpx.AsyncClient(timeout=6.0, follow_redirects=True, headers=headers)
             should_close = True
 
         try:
             candidate_titles: list[str] = []
+            non_org_wd_words = ("film", "movie", "novel", "book", "song", "album", "band", "television", "episode", "village", "river", "municipality", "comic")
 
-            # 1. Query Wikidata first for exact company entity matching
-            for wq in queries[:2]:
+            # 1 & 2. Run Wikidata entity search and Wikipedia article search concurrently
+            wd_queries = [q for q in [legal_name, company_name, domain_root] if q and len(q) >= 3][:2]
+
+            async def _wd_search(wq: str) -> list[str]:
+                matched_ids: list[str] = []
                 try:
-                    wd_url = f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={urllib.parse.quote(wq)}&language=en&limit=4&format=json"
-                    wd_r = await client.get(wd_url, headers=headers, timeout=5.0)
+                    wd_url = f"https://www.wikidata.org/w/api.php?action=wbsearchentities&search={urllib.parse.quote(wq)}&language=en&limit=5&format=json"
+                    wd_r = await client.get(wd_url, headers=headers, timeout=3.5)
                     if wd_r.status_code == 200:
                         for wd_item in wd_r.json().get("search", []):
                             wd_desc = (wd_item.get("description") or "").lower()
                             wd_id = wd_item.get("id", "")
-                            if any(k in wd_desc for k in ["company", "corporation", "enterprise", "software", "platform", "organization", "firm", "cybersecurity", "financial", "provider", "business", "startup", "founded"]):
-                                if wd_id and not intel["wikidata_id"]:
-                                    intel["wikidata_id"] = wd_id
-                                # Follow sitelink to enwiki if available
-                                try:
-                                    ent_r = await client.get(
-                                        f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={wd_id}&props=sitelinks&sitefilter=enwiki&format=json",
-                                        headers=headers,
-                                        timeout=5.0,
-                                    )
-                                    if ent_r.status_code == 200:
-                                        en_title = ent_r.json().get("entities", {}).get(wd_id, {}).get("sitelinks", {}).get("enwiki", {}).get("title")
-                                        if en_title and en_title not in candidate_titles:
-                                            candidate_titles.append(en_title)
-                                except Exception:
-                                    pass
-                                break
+                            if any(bad in wd_desc for bad in non_org_wd_words):
+                                continue
+                            if any(k in wd_desc for k in ["company", "corporation", "enterprise", "software", "platform", "organization", "firm", "cybersecurity", "financial", "provider", "business", "startup", "founded", "fintech", "technology"]):
+                                if wd_id:
+                                    matched_ids.append(wd_id)
                 except Exception:
                     pass
-                if intel["wikidata_id"]:
-                    break
+                return matched_ids
 
-            # 2. Query Wikipedia search API across candidate queries
-            for q in queries[:4]:
+            async def _wp_search(q_str: str) -> list[str]:
                 try:
-                    search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q)}&utf8=&format=json"
-                    r = await client.get(search_url, headers=headers, timeout=6.0)
+                    search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q_str)}&utf8=&format=json"
+                    r = await client.get(search_url, headers=headers, timeout=3.8)
                     if r.status_code == 200:
-                        for res in r.json().get("query", {}).get("search", [])[:4]:
-                            t = res.get("title")
-                            if t and t not in candidate_titles:
-                                candidate_titles.append(t)
+                        return [res.get("title") for res in r.json().get("query", {}).get("search", [])[:4] if res.get("title")]
+                except Exception:
+                    pass
+                return []
+
+            wd_coros = [_wd_search(wq) for wq in wd_queries]
+            wp_coros = [_wp_search(q) for q in queries[:5]]
+            combined_search = await asyncio.gather(*wd_coros, *wp_coros, return_exceptions=True)
+
+            wd_ids: list[str] = []
+            for res in combined_search[: len(wd_coros)]:
+                if isinstance(res, list):
+                    for wid in res:
+                        if wid not in wd_ids:
+                            wd_ids.append(wid)
+            if wd_ids:
+                intel["wikidata_id"] = wd_ids[0]
+                try:
+                    ent_r = await client.get(
+                        f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={'|'.join(wd_ids[:3])}&props=sitelinks&sitefilter=enwiki&format=json",
+                        headers=headers,
+                        timeout=3.0,
+                    )
+                    if ent_r.status_code == 200:
+                        entities_map = ent_r.json().get("entities", {})
+                        for wid in wd_ids[:3]:
+                            en_title = entities_map.get(wid, {}).get("sitelinks", {}).get("enwiki", {}).get("title")
+                            if en_title and en_title not in candidate_titles:
+                                candidate_titles.append(en_title)
                 except Exception:
                     pass
 
-            # 3. Inspect candidate Wikipedia articles and select the authoritative company match
-            for title in candidate_titles[:6]:
-                try:
-                    parse_url = f"https://en.wikipedia.org/w/api.php?action=parse&page={urllib.parse.quote(title)}&prop=text&section=0&format=json"
-                    p_resp = await client.get(parse_url, headers=headers, timeout=6.0)
-                    if p_resp.status_code != 200:
-                        continue
-                    html_text = p_resp.json().get("parse", {}).get("text", {}).get("*", "")
-                    if not html_text:
-                        continue
-                    soup = BeautifulSoup(html_text, "html.parser")
-                    infobox = soup.find("table", class_=re.compile(r"infobox", re.I))
-                    if not infobox:
-                        continue
+            for batch in combined_search[len(wd_coros):]:
+                if isinstance(batch, list):
+                    for t in batch:
+                        if t not in candidate_titles:
+                            candidate_titles.append(t)
 
-                    # Verify relevance: check infobox website or article title against company/domain
-                    infobox_text_low = infobox.get_text(" ", strip=True).lower()
-                    infobox_links_low = " ".join(a.get("href", "").lower() for a in infobox.find_all("a", href=True))
-                    comp_words = [w for w in company_name.lower().split() if len(w) >= 3]
-                    domain_matched = clean_domain in infobox_text_low or clean_domain in infobox_links_low or domain_root in infobox_links_low
-                    title_matched = any(w in title.lower() for w in comp_words) or domain_root in title.lower()
+            # 3. Inspect candidate Wikipedia articles concurrently
+            matched_intel = await cls._inspect_wikipedia_candidates(
+                candidate_titles=candidate_titles,
+                company_name=company_name,
+                clean_domain=clean_domain,
+                domain_root=domain_root,
+                client=client,
+                headers=headers,
+                base_intel=intel,
+            )
+            return matched_intel
+        finally:
+            if should_close:
+                await client.aclose()
 
-                    if not (domain_matched or title_matched):
+    @classmethod
+    async def inspect_wikipedia_titles(
+        cls,
+        candidate_titles: list[str],
+        company_name: str,
+        domain: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> dict[str, Any]:
+        """Inspects pre-discovered Wikipedia titles (e.g. from web search) for authoritative company matches."""
+        clean_domain = domain.lower().replace("www.", "").strip()
+        domain_root = clean_domain.split(".")[0]
+        headers = {
+            "User-Agent": "FootprintHub-OSINT/1.0 (contact@footprinthub.com; https://footprinthub.com) Mozilla/5.0"
+        }
+        base_intel: dict[str, Any] = {
+            "founders": [],
+            "description": "",
+            "industry": "",
+            "headquarters": "",
+            "founded_year": "",
+            "estimated_employees": "",
+            "parent_organization": "",
+            "source_article": "",
+            "source_url": "",
+            "wikidata_id": "",
+            "wikipedia_status": "not_listed",
+            "searched_queries": [],
+            "candidate_slugs": [],
+        }
+        if not candidate_titles:
+            return base_intel
+        should_close = False
+        if not client:
+            client = httpx.AsyncClient(timeout=5.0, follow_redirects=True, headers=headers)
+            should_close = True
+        try:
+            return await cls._inspect_wikipedia_candidates(
+                candidate_titles=candidate_titles,
+                company_name=company_name,
+                clean_domain=clean_domain,
+                domain_root=domain_root,
+                client=client,
+                headers=headers,
+                base_intel=base_intel,
+            )
+        finally:
+            if should_close:
+                await client.aclose()
+
+    @classmethod
+    async def _inspect_wikipedia_candidates(
+        cls,
+        candidate_titles: list[str],
+        company_name: str,
+        clean_domain: str,
+        domain_root: str,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        base_intel: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Concurrently fetches and validates candidate Wikipedia infoboxes for company/software relevance."""
+        intel = dict(base_intel)
+        filtered_titles = [
+            t for t in candidate_titles
+            if t and not any(bad in t.lower() for bad in ["(film)", "(novel)", "(song)", "(album)", "(disambiguation)", "(band)", "(tv series)"])
+        ][:6]
+        if not filtered_titles:
+            return intel
+
+        async def _fetch_parse(t: str) -> tuple[str, str]:
+            try:
+                parse_url = f"https://en.wikipedia.org/w/api.php?action=parse&page={urllib.parse.quote(t)}&prop=text&section=0&format=json"
+                p_resp = await client.get(parse_url, headers=headers, timeout=3.5)
+                if p_resp.status_code == 200:
+                    return (t, p_resp.json().get("parse", {}).get("text", {}).get("*", "") or "")
+            except Exception:
+                pass
+            return (t, "")
+
+        parsed_articles = await asyncio.gather(*[_fetch_parse(t) for t in filtered_titles])
+        non_org_infobox_labels = {
+            "directed by", "starring", "cinematography", "screenplay", "box office",
+            "running time", "produced by", "distributed by", "narrated by",
+            "music by", "edited by", "release date", "studio", "album",
+            "population", "elevation", "mayor", "coordinates", "born", "died",
+        }
+
+        for title, html_text in parsed_articles:
+            if not html_text:
+                continue
+            try:
+                soup = BeautifulSoup(html_text, "html.parser")
+                infobox = soup.find("table", class_=re.compile(r"infobox", re.I))
+                if not infobox:
+                    continue
+
+                # Verify relevance: check explicit official website row or article title against company/domain
+                # (Do not match arbitrary <sup class="reference"> citation links inside unrelated infoboxes)
+                comp_words = [w for w in company_name.lower().split() if len(w) >= 3]
+                title_low = title.lower()
+                title_matched = (
+                    (len(domain_root) >= 3 and domain_root in title_low)
+                    or (bool(comp_words) and all(w in title_low for w in comp_words))
+                )
+
+                parsed_industry = ""
+                parsed_hq = ""
+                parsed_emp = ""
+                parsed_founded = ""
+                parsed_parent = ""
+                parsed_founders: list[dict[str, Any]] = []
+                parsed_slugs: list[str] = []
+                website_mismatch = False
+                official_website_matched = False
+                non_org_article = False
+                seen_labels: set[str] = set()
+
+                for tr in infobox.find_all("tr"):
+                    th = tr.find(["th", "td"], class_=re.compile(r"label", re.I)) or tr.find("th")
+                    td = tr.find("td", class_=re.compile(r"data", re.I)) or tr.find("td")
+                    if not th or not td or th == td:
                         continue
+                    lbl = th.get_text(" ", strip=True).lower().replace("\xa0", " ")
+                    seen_labels.add(lbl)
+                    if any(nol in lbl for nol in non_org_infobox_labels):
+                        non_org_article = True
+                        break
+                    val = re.sub(r"\[\s*\d+\s*\]", "", td.get_text(" ", strip=True)).strip()
 
-                    # Reset temporary fields for this candidate
-                    parsed_industry = ""
-                    parsed_hq = ""
-                    parsed_emp = ""
-                    parsed_founded = ""
-                    parsed_parent = ""
-                    parsed_founders: list[dict[str, Any]] = []
-                    parsed_slugs: list[str] = []
-                    website_mismatch = False
-
-                    for tr in infobox.find_all("tr"):
-                        th = tr.find(["th", "td"], class_=re.compile(r"label", re.I)) or tr.find("th")
-                        td = tr.find("td", class_=re.compile(r"data", re.I)) or tr.find("td")
-                        if not th or not td or th == td:
+                    if "website" in lbl or lbl == "url":
+                        site_low = (val + " " + " ".join(a.get("href", "") for a in td.find_all("a", href=True))).lower()
+                        if site_low and (clean_domain in site_low or (len(domain_root) >= 3 and domain_root in site_low)):
+                            official_website_matched = True
+                        elif site_low:
+                            website_mismatch = True
+                            break
+                    elif "industry" in lbl and not parsed_industry:
+                        parsed_industry = val
+                    elif "headquarters" in lbl and not parsed_hq:
+                        parsed_hq = val
+                    elif "founded" in lbl and not parsed_founded:
+                        ym = re.search(r"(19\d\d|20\d\d)", val)
+                        if ym:
+                            parsed_founded = ym.group(1)
+                    elif ("employee" in lbl or "size" in lbl) and not parsed_emp:
+                        parsed_emp = val
+                    elif "owner" in lbl or "parent" in lbl:
+                        parsed_parent = val
+                        parent_clean = re.sub(r"[^a-zA-Z0-9_-]", "-", val.lower().strip()).strip("-")
+                        if parent_clean and len(parent_clean) > 3:
+                            parsed_slugs.append(parent_clean)
+                    elif any(k in lbl for k in ["founder", "key people", "leader", "ceo", "author", "developer"]):
+                        if "developer" in lbl and not any(k in lbl for k in ["founder", "author"]):
                             continue
-                        lbl = th.get_text(" ", strip=True).lower().replace("\xa0", " ")
-                        val = re.sub(r"\[\s*\d+\s*\]", "", td.get_text(" ", strip=True)).strip()
+                        extracted_here: list[str] = []
+                        for a_tag in td.find_all("a"):
+                            name = " ".join(re.sub(r"\[\s*\d+\s*\]", "", a_tag.get_text(" ", strip=True)).split()).strip()
+                            if 1 < len(name.split()) <= 4:
+                                extracted_here.append(name)
+                        if not extracted_here:
+                            for raw_part in re.split(r"[,;\n•|]+", val):
+                                clean_p = " ".join(re.sub(r"\([^)]*\)", "", raw_part).split()).strip()
+                                if 1 < len(clean_p.split()) <= 4 and all(re.match(r"^[A-Z][a-zA-Z.'-]*$", w) for w in clean_p.split()):
+                                    extracted_here.append(clean_p)
+                        # Drop compound anchor strings that concatenate >=2 individually extracted names
+                        if len(extracted_here) >= 2:
+                            low_list = [n.lower() for n in extracted_here]
+                            extracted_here = [
+                                n for n in extracted_here
+                                if sum(1 for other in low_list if other != n.lower() and other in n.lower()) < 2
+                            ]
+                        for name in extracted_here:
+                            if name not in [f["name"] for f in parsed_founders]:
+                                if not any(stop in name.lower() for stop in ["university", "college", "software", "limited", "inc", "company", "corporation", "foundation", "institute"]):
+                                    parsed_founders.append({
+                                        "name": name,
+                                        "title": "Founder / Key Executive",
+                                        "department": "Executive Leadership",
+                                        "linkedin_url": "",
+                                        "source": f"Wikipedia / Open Knowledge ({title})",
+                                        "is_founder": True,
+                                        "is_verified": True,
+                                    })
 
-                        if "website" in lbl:
-                            # If infobox lists an official website and domain_root is nowhere in it, reject unrelated orgs
-                            site_low = (val + " " + " ".join(a.get("href", "") for a in td.find_all("a", href=True))).lower()
-                            if site_low and domain_root not in site_low and clean_domain not in site_low:
-                                website_mismatch = True
-                                break
-                        elif "industry" in lbl and not parsed_industry:
-                            parsed_industry = val
-                        elif "headquarters" in lbl and not parsed_hq:
-                            parsed_hq = val
-                        elif "founded" in lbl and not parsed_founded:
-                            ym = re.search(r"(19\d\d|20\d\d)", val)
-                            if ym:
-                                parsed_founded = ym.group(1)
-                        elif ("employee" in lbl or "size" in lbl) and not parsed_emp:
-                            parsed_emp = val
-                        elif "owner" in lbl or "parent" in lbl:
-                            parsed_parent = val
-                            parent_clean = re.sub(r"[^a-zA-Z0-9_-]", "-", val.lower().strip()).strip("-")
-                            if parent_clean and len(parent_clean) > 3:
-                                parsed_slugs.append(parent_clean)
-                        elif any(k in lbl for k in ["founder", "key people", "leader", "ceo", "author"]):
-                            # Prefer linked person names, fallback to plain text list items / comma-separated names
-                            extracted_here: list[str] = []
-                            for a_tag in td.find_all("a"):
-                                name = re.sub(r"\[\s*\d+\s*\]", "", a_tag.get_text(strip=True)).strip()
-                                if 1 < len(name.split()) <= 4:
-                                    extracted_here.append(name)
-                            if not extracted_here:
-                                for raw_part in re.split(r"[,;\n•|]+", val):
-                                    clean_p = re.sub(r"\([^)]*\)", "", raw_part).strip()
-                                    if 1 < len(clean_p.split()) <= 4 and all(re.match(r"^[A-Z][a-zA-Z.'-]*$", w) for w in clean_p.split()):
-                                        extracted_here.append(clean_p)
-                            for name in extracted_here:
-                                if name not in [f["name"] for f in parsed_founders]:
-                                    if not any(stop in name.lower() for stop in ["university", "college", "software", "limited", "inc", "company", "corporation", "foundation", "institute"]):
-                                        parsed_founders.append({
-                                            "name": name,
-                                            "title": "Founder / Key Executive",
-                                            "department": "Executive Leadership",
-                                            "linkedin_url": "",
-                                            "source": f"Wikipedia / Open Knowledge ({title})",
-                                            "is_founder": True,
-                                            "is_verified": True,
-                                        })
+                # Also remove compound duplicates across different infobox rows (e.g. "Ritesh Arora Nakul Aggarwal")
+                if len(parsed_founders) >= 2:
+                    all_f_low = [f["name"].lower() for f in parsed_founders]
+                    parsed_founders = [
+                        f for f in parsed_founders
+                        if sum(1 for other in all_f_low if other != f["name"].lower() and other in f["name"].lower()) < 2
+                    ]
 
-                    if website_mismatch:
-                        continue
+                if website_mismatch or non_org_article or not (official_website_matched or title_matched):
+                    continue
 
-                    if parsed_founders or parsed_industry or parsed_hq or domain_matched:
-                        intel["industry"] = parsed_industry
-                        intel["headquarters"] = parsed_hq
-                        intel["estimated_employees"] = parsed_emp
-                        intel["founded_year"] = parsed_founded
-                        intel["parent_organization"] = parsed_parent
-                        intel["founders"] = parsed_founders
-                        intel["candidate_slugs"] = parsed_slugs
-                        intel["source_article"] = title
-                        intel["source_url"] = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
-                        intel["wikipedia_status"] = "found"
-                        slug_from_title = re.sub(r"[^a-zA-Z0-9_-]", "-", title.lower().strip()).strip("-")
-                        if slug_from_title and slug_from_title not in intel["candidate_slugs"]:
-                            intel["candidate_slugs"].append(slug_from_title)
+                has_org_signal = bool(
+                    parsed_founders or parsed_industry or parsed_hq or parsed_founded or official_website_matched
+                    or any(any(k in lb for k in ["website", "type", "services", "products", "revenue", "employees", "parent"]) for lb in seen_labels)
+                )
+                if has_org_signal:
+                    intel["industry"] = parsed_industry
+                    intel["headquarters"] = parsed_hq
+                    intel["estimated_employees"] = parsed_emp
+                    intel["founded_year"] = parsed_founded
+                    intel["parent_organization"] = parsed_parent
+                    intel["founders"] = parsed_founders
+                    intel["candidate_slugs"] = parsed_slugs
+                    intel["source_article"] = title
+                    intel["source_url"] = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+                    intel["wikipedia_status"] = "found"
+                    slug_from_title = re.sub(r"[^a-zA-Z0-9_-]", "-", title.lower().strip()).strip("-")
+                    if slug_from_title and slug_from_title not in intel["candidate_slugs"]:
+                        intel["candidate_slugs"].append(slug_from_title)
 
-                        # Fetch summary description
+                    try:
+                        s_resp = await client.get(
+                            f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}",
+                            headers=headers,
+                            timeout=3.0,
+                        )
+                        if s_resp.status_code == 200:
+                            intel["description"] = s_resp.json().get("extract", "")
+                    except Exception:
+                        pass
+
+                    if not intel["founders"] and intel["description"]:
+                        lead_m = re.search(
+                            r"(?:founded|co-founded)\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,3})",
+                            intel["description"],
+                        )
+                        if lead_m:
+                            f_n = lead_m.group(1).strip()
+                            intel["founders"].append({
+                                "name": f_n,
+                                "title": "Founder",
+                                "department": "Executive Leadership",
+                                "linkedin_url": "",
+                                "source": f"Wikipedia / Open Knowledge ({title})",
+                                "is_founder": True,
+                                "is_verified": True,
+                            })
+
+                    if intel["founders"]:
                         try:
-                            s_resp = await client.get(
-                                f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}",
-                                headers=headers,
-                                timeout=5.0,
-                            )
-                            if s_resp.status_code == 200:
-                                intel["description"] = s_resp.json().get("extract", "")
-                        except Exception:
-                            pass
-
-                        # Fallback: extract founders from lead narrative if infobox omitted them
-                        if not intel["founders"] and intel["description"]:
-                            lead_m = re.search(
-                                r"(?:founded|co-founded)\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,3})",
-                                intel["description"],
-                            )
-                            if lead_m:
-                                f_n = lead_m.group(1).strip()
-                                intel["founders"].append({
-                                    "name": f_n,
-                                    "title": "Founder",
-                                    "department": "Executive Leadership",
-                                    "linkedin_url": "",
-                                    "source": f"Wikipedia / Open Knowledge ({title})",
-                                    "is_founder": True,
-                                    "is_verified": True,
-                                })
-
-                        # Enrich individual founders with person profile, biography, photo and source references
-                        if intel["founders"]:
                             p_tasks = [
                                 cls.enrich_person_profile(f["name"], company_name, domain=clean_domain, client=client)
                                 for f in intel["founders"][:3]
                             ]
-                            p_results = await asyncio.gather(*p_tasks, return_exceptions=True)
+                            p_results = await asyncio.wait_for(
+                                asyncio.gather(*p_tasks, return_exceptions=True),
+                                timeout=3.0,
+                            )
                             for idx, p_res in enumerate(p_results):
                                 if isinstance(p_res, dict) and p_res:
                                     target_f = intel["founders"][idx]
@@ -1887,15 +2099,219 @@ class PublicKnowledgeHarvester:
                                             target_f[key] = p_res[key]
                                     if p_res.get("current_role") and target_f.get("title") in ("Founder", "Founder / Key Executive", "Key Executive", None):
                                         target_f["title"] = p_res["current_role"]
+                        except Exception:
+                            pass
 
-                        return intel
+                    return intel
+            except Exception:
+                pass
+
+        return intel
+
+    @classmethod
+    async def dig_online_intelligence(
+        cls,
+        company_name: str,
+        domain: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> dict[str, Any]:
+        """
+        Actively digs live online search results (Yahoo Web Search organic index) to discover
+        founders, CEOs, LinkedIn profiles, Wikipedia pages, and official social channels—even
+        for companies that use heavy SPAs, bot protection, or are not listed on Wikipedia.
+        """
+        clean_domain = domain.lower().replace("www.", "").strip()
+        domain_root = clean_domain.split(".")[0]
+        comp_low = (company_name or domain_root).lower().strip()
+
+        out: dict[str, Any] = {
+            "founders": [],
+            "social_profiles": [],
+            "wikipedia_titles": [],
+            "linkedin_company_url": "",
+            "search_snippets": [],
+        }
+
+        queries = [
+            f"{company_name} founder CEO",
+            f'"{clean_domain}" OR "{company_name}" site:linkedin.com/company OR site:en.wikipedia.org',
+        ]
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        should_close = False
+        if not client:
+            client = httpx.AsyncClient(timeout=8.0, follow_redirects=True)
+            should_close = True
+
+        def _unwrap_yahoo_url(href: str) -> str:
+            m_ru = re.search(r"/RU=([^/]+)/", href or "")
+            if m_ru:
+                try:
+                    return urllib.parse.unquote(m_ru.group(1))
                 except Exception:
                     pass
+            return href or ""
+
+        def _norm_role(raw_r: str) -> str:
+            cleaned = re.sub(r"\bco-\s+", "Co-", raw_r, flags=re.I)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-|")
+            return re.sub(r"\b(Ceo|Cto|Coo|Cfo|Ciso|Vp)\b", lambda m: m.group(1).upper(), cleaned.title())
+
+        def _strip_yahoo_title(raw_t: str) -> str:
+            # Yahoo anchor text often prepends breadcrumb: "LinkedIn https://www.linkedin.com › in › slug Name - Title"
+            cleaned = re.sub(r"^(?:[A-Za-z0-9._-]+\s+)?https?://[^\s]+(?:\s+›\s+[^\s]+)*\s+", "", raw_t or "").strip()
+            cleaned = re.sub(r"\s*[|•]\s*(?:LinkedIn|Crunchbase|Forbes.*|RocketReach).*$", "", cleaned, flags=re.I)
+            cleaned = re.sub(r"\([^)]*\)", "", cleaned).strip()
+            return cleaned
+
+        seen_founder_names: set[str] = set()
+        seen_soc_keys: set[str] = set()
+
+        async def _query_yahoo(q_str: str) -> str:
+            try:
+                resp = await client.get(
+                    f"https://search.yahoo.com/search?p={urllib.parse.quote(q_str)}",
+                    headers=headers,
+                    timeout=6.0,
+                )
+                if resp.status_code == 200 and resp.text:
+                    return resp.text
+            except Exception:
+                pass
+            return ""
+
+        try:
+            pages = await asyncio.gather(*[_query_yahoo(q) for q in queries])
+            for html_body in pages:
+                if not html_body:
+                    continue
+                soup = BeautifulSoup(html_body, "html.parser")
+                for algo in soup.select("div.algo")[:8]:
+                    a_tag = algo.select_one("h3 a, a")
+                    if not a_tag:
+                        continue
+                    dest_url = _unwrap_yahoo_url(a_tag.get("href", ""))
+                    raw_title = re.sub(r"\s+", " ", a_tag.get_text(" ", strip=True)).strip()
+                    snip_el = algo.select_one("div.compText, p")
+                    snippet = re.sub(r"\s+", " ", snip_el.get_text(" ", strip=True)).strip() if snip_el else ""
+
+                    combined_low = f"{raw_title} {snippet} {dest_url}".lower()
+                    # Verify strong relevance to the target company/domain
+                    is_relevant = (
+                        clean_domain in combined_low
+                        or (len(comp_low) >= 4 and comp_low in combined_low)
+                        or (len(domain_root) >= 4 and domain_root in combined_low)
+                    )
+                    if not is_relevant:
+                        continue
+
+                    if snippet and len(out["search_snippets"]) < 6:
+                        out["search_snippets"].append({"title": raw_title, "url": dest_url, "snippet": snippet[:280]})
+
+                    # 1. Discover official LinkedIn company URL or social channels
+                    for soc in SocialMediaScraper.extract_social_links(dest_url):
+                        if soc.get("type") == "personal":
+                            continue
+                        handle_low = soc.get("handle", "").lower()
+                        if (len(domain_root) >= 3 and domain_root in handle_low) or (len(comp_low) >= 4 and comp_low.replace(" ", "") in handle_low.replace("-", "")):
+                            dk = f"{soc['platform']}:{handle_low}"
+                            if dk not in seen_soc_keys:
+                                seen_soc_keys.add(dk)
+                                soc["found_on_website"] = False
+                                soc["source"] = "Online OSINT Search"
+                                out["social_profiles"].append(soc)
+                                if soc["platform"] == "LinkedIn" and soc.get("type") == "company" and not out["linkedin_company_url"]:
+                                    out["linkedin_company_url"] = soc["url"]
+
+                    # 2. Discover Wikipedia pages for company or founder
+                    if "en.wikipedia.org/wiki/" in dest_url.lower():
+                        wiki_t = urllib.parse.unquote(dest_url.split("/wiki/")[-1].split("#")[0].split("?")[0]).replace("_", " ")
+                        if wiki_t and wiki_t not in out["wikipedia_titles"]:
+                            out["wikipedia_titles"].append(wiki_t)
+
+                    # 3. Extract founder/CEO from LinkedIn /in/ or verified executive profile search results
+                    is_exec_profile_site = any(
+                        host_tok in dest_url.lower()
+                        for host_tok in ("linkedin.com/in/", "crunchbase.com/person/", "forbes.com/", "rocketreach.co/", "tracxn.com/")
+                    )
+                    if is_exec_profile_site:
+                        clean_t = _strip_yahoo_title(raw_title)
+                        parts = [p.strip() for p in re.split(r"\s+(?:[-–—|]|,)\s+", clean_t) if p.strip()]
+                        cand_name = parts[0] if parts else ""
+                        cand_role_text = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+                        # Validate person name (2-4 words, capitalized)
+                        n_words = cand_name.split()
+                        if 2 <= len(n_words) <= 4 and all(re.match(r"^[A-Z][a-zA-Z.'-]*$", w) for w in n_words):
+                            # Confirm executive role appears in title or snippet alongside company
+                            role_m = re.search(
+                                r"\b((?:Co-?\s*)?Founder(?:\s*(?:&|and|,)\s*(?:CEO|CTO|COO|President|Managing Director))?|Chief Executive Officer|CEO(?:\s*(?:&|and|,)\s*(?:Co-?\s*)?Founder)?|Managing Director|President)\b",
+                                f"{cand_role_text} {snippet}",
+                                re.I,
+                            )
+                            if role_m:
+                                # Ensure they aren't explicitly listed as founder of a *different* company
+                                text_after_role = f"{cand_role_text}".lower()
+                                tied_to_target = (
+                                    comp_low in f"{raw_title} {snippet}".lower()
+                                    or domain_root in f"{raw_title} {snippet}".lower()
+                                )
+                                li_profile_url = dest_url if "linkedin.com/in/" in dest_url.lower() else ""
+                                if tied_to_target and (not text_after_role or comp_low in text_after_role or domain_root in text_after_role or "at " not in text_after_role):
+                                    nk = cand_name.lower()
+                                    if nk not in seen_founder_names:
+                                        seen_founder_names.add(nk)
+                                        role_clean = _norm_role(role_m.group(0))
+                                        out["founders"].append({
+                                            "name": cand_name,
+                                            "title": role_clean,
+                                            "department": "Executive Leadership",
+                                            "linkedin_url": li_profile_url,
+                                            "linkedin_search_url": li_profile_url or f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(cand_name + ' ' + company_name)}",
+                                            "bio": snippet or f"{role_clean} at {company_name}",
+                                            "source": "Online OSINT Search (LinkedIn / Web Index)" if li_profile_url else "Online OSINT Search (Web Index)",
+                                            "source_references": [
+                                                {"name": f"{company_name} official website", "url": f"https://{clean_domain}", "icon": "🌐"},
+                                                {"name": "LinkedIn Profile" if li_profile_url else raw_title[:50], "url": dest_url, "icon": "💼" if li_profile_url else "🔍"},
+                                            ],
+                                            "is_verified": True,
+                                            "is_founder": True,
+                                        })
+
+                    # 4. Extract founder/CEO from Wikipedia or Crunchbase snippet text
+                    for fm in re.finditer(
+                        r"(?:founded|co-founded)\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-zA-Z.'-]*){1,3})(?:\s+(?:and|&)\s+([A-Z][a-z]{1,}(?:\s+[A-Z][a-zA-Z.'-]*){1,3}))?",
+                        f"{raw_title} {snippet}",
+                    ):
+                        for grp_idx, grp_role in [(1, "Founder"), (2, "Co-Founder")]:
+                            fn = fm.group(grp_idx)
+                            if fn and not any(bad in fn.lower() for bad in ["the ", "our ", "its ", "company", "group"]):
+                                nk = fn.lower().strip()
+                                if nk not in seen_founder_names:
+                                    seen_founder_names.add(nk)
+                                    out["founders"].append({
+                                        "name": fn.strip(),
+                                        "title": grp_role,
+                                        "department": "Executive Leadership",
+                                        "linkedin_url": "",
+                                        "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(fn.strip() + ' ' + company_name)}",
+                                        "bio": snippet or f"{grp_role} of {company_name}",
+                                        "source": "Online OSINT Search (Web Index)",
+                                        "source_references": [
+                                            {"name": raw_title[:60], "url": dest_url, "icon": "🌐"},
+                                        ],
+                                        "is_verified": True,
+                                        "is_founder": True,
+                                    })
+        except Exception:
+            pass
         finally:
             if should_close:
                 await client.aclose()
 
-        return intel
+        return out
 
     @classmethod
     async def search_person_image(

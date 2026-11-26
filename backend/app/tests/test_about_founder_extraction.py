@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from app.modules.osint_helpers import CompanyMetadataScraper
 
@@ -178,6 +179,102 @@ class TestAboutFounderExtraction(unittest.TestCase):
         self.assertIn("Chennai", meta["headquarters"])
         srini = next(f for f in meta["founders"] if f["name"] == "Srinivasan M. S.")
         self.assertEqual(srini["photo_url"], "https://auriseg.com/images/About%20Us/team/Srini%20-%20Photo.png")
+
+    def test_tailwind_generic_cards_and_noise_rejection(self):
+        html = """
+        <div class="grid grid-cols-2 gap-6">
+            <div class="border-gray-200 p-6">
+                <h3 class="font-semibold text-gray-900">Akash Mahajan</h3>
+                <p class="text-sm text-gray-600">Founder &amp; CEO</p>
+                <p class="text-gray-700">15+ years in application and cloud security.</p>
+            </div>
+            <div>
+                <p>Meet Postman's CEO Abhinav Asthana and learn more.</p>
+            </div>
+        </div>
+        """
+        meta = CompanyMetadataScraper.extract_company_metadata(html, "appsecco.com", "Appsecco")
+        names = [f["name"] for f in meta["founders"]]
+        self.assertIn("Akash Mahajan", names)
+        self.assertNotIn("Meet Postman's", names)
+        self.assertNotIn("Meet Postmans", names)
+
+    def test_wikipedia_infobox_footnote_and_compound_dedup(self):
+        import json as _json
+        import unittest.mock as _mock
+        from app.modules.osint_helpers import PublicKnowledgeHarvester
+
+        unrelated_infobox_html = """
+        <table class="infobox">
+            <tr><th>Category</th><td>Online threat</td></tr>
+            <tr><td>Ref <sup class="reference"><a href="https://cloudsek.com/blog/report">1</a></sup></td></tr>
+        </table>
+        """
+        company_infobox_html = """
+        <table class="infobox">
+            <tr><th>Founders</th><td><a href="/wiki/A">Ritesh Arora</a> <a href="/wiki/B">Nakul Aggarwal</a><a href="/wiki/AB">Ritesh Arora  Nakul Aggarwal</a></td></tr>
+            <tr><th>Website</th><td><a href="https://www.browserstack.com">browserstack.com</a></td></tr>
+        </table>
+        """
+
+        class _FakeResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                if "Cyber" in url:
+                    return _FakeResp(200, {"parse": {"text": {"*": unrelated_infobox_html}}})
+                if "BrowserStack" in url:
+                    return _FakeResp(200, {"parse": {"text": {"*": company_infobox_html}}})
+                return _FakeResp(404, {})
+
+        async def _run():
+            res_unrelated = await PublicKnowledgeHarvester._inspect_wikipedia_candidates(
+                ["Cyber Jihad Movement"], "CloudSEK", "cloudsek.com", "cloudsek", _FakeClient(), {}, {"founders": [], "wikipedia_status": "not_listed"}
+            )
+            self.assertEqual(res_unrelated["wikipedia_status"], "not_listed")
+
+            with _mock.patch.object(PublicKnowledgeHarvester, "enrich_person_profile", return_value={}):
+                res_bs = await PublicKnowledgeHarvester._inspect_wikipedia_candidates(
+                    ["BrowserStack"], "BrowserStack", "browserstack.com", "browserstack", _FakeClient(), {}, {"founders": [], "wikipedia_status": "not_listed"}
+                )
+            self.assertEqual(res_bs["wikipedia_status"], "found")
+            bs_names = [f["name"] for f in res_bs["founders"]]
+            self.assertEqual(bs_names, ["Ritesh Arora", "Nakul Aggarwal"])
+
+        asyncio.run(_run())
+
+    def test_yahoo_breadcrumb_stripping_for_founder(self):
+        import urllib.parse as _up
+        from app.modules.osint_helpers import PublicKnowledgeHarvester
+
+        wrapped = _up.quote("https://www.linkedin.com/in/tanmaig", safe="")
+        yahoo_html = f"""
+        <div class="algo">
+            <h3><a href="https://r.search.yahoo.com/_ylt=1/RU={wrapped}/RK=2/">LinkedIn https://www.linkedin.com › in › tanmaig Tanmai Gopal - PromptQL | LinkedIn</a></h3>
+            <div class="compText"><p>Hi! I'm Tanmai, co- founder and CEO of PromptQL (Hasura).</p></div>
+        </div>
+        """
+
+        class _FakeResp:
+            status_code = 200
+            text = yahoo_html
+
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                return _FakeResp()
+
+        res = asyncio.run(PublicKnowledgeHarvester.dig_online_intelligence("PromptQL", "hasura.io", client=_FakeClient()))
+        f_names = [f["name"] for f in res["founders"]]
+        self.assertIn("Tanmai Gopal", f_names)
+        tanmai = next(f for f in res["founders"] if f["name"] == "Tanmai Gopal")
+        self.assertEqual(tanmai["linkedin_url"], "https://www.linkedin.com/in/tanmaig")
+        self.assertIn("Founder", tanmai["title"])
 
 if __name__ == "__main__":
     unittest.main()

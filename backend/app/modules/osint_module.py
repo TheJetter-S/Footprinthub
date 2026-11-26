@@ -215,115 +215,121 @@ class BehindTheEmailEngine:
 
         social_accounts: list[dict[str, Any]] = []
 
-        # 1. Gravatar (silent passive hash check)
-        gravatar_found = False
-        gravatar_avatar = None
-        gravatar_display = None
-        try:
-            resp = await client.get(f"https://en.gravatar.com/{md5_hash}.json", timeout=3.5)
-            if resp.status_code == 200:
-                g_data = resp.json().get("entry", [{}])[0]
-                gravatar_found = True
-                gravatar_display = g_data.get("displayName") or g_data.get("preferredUsername")
-                gravatar_avatar = g_data.get("thumbnailUrl") or f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
-            else:
-                # Fallback to avatar check
-                avatar_resp = await client.head(f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=2.5)
-                if avatar_resp.status_code == 200:
+        # 1-3. Run Gravatar, Duolingo, and GitHub passive checks concurrently (bounded timeouts)
+        async def _check_gravatar() -> dict[str, Any]:
+            gravatar_found = False
+            gravatar_avatar = None
+            gravatar_display = None
+            try:
+                resp = await client.get(f"https://en.gravatar.com/{md5_hash}.json", timeout=2.0)
+                if resp.status_code == 200:
+                    g_data = resp.json().get("entry", [{}])[0]
                     gravatar_found = True
-                    gravatar_avatar = f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
-        except Exception:
-            pass
+                    gravatar_display = g_data.get("displayName") or g_data.get("preferredUsername")
+                    gravatar_avatar = g_data.get("thumbnailUrl") or f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
+                else:
+                    avatar_resp = await client.head(f"https://www.gravatar.com/avatar/{md5_hash}?d=404", timeout=1.8)
+                    if avatar_resp.status_code == 200:
+                        gravatar_found = True
+                        gravatar_avatar = f"https://www.gravatar.com/avatar/{md5_hash}?s=200"
+            except Exception:
+                pass
+            return {
+                "platform": "Gravatar",
+                "status": "found" if gravatar_found else "not_detected",
+                "verified": gravatar_found,
+                "username": gravatar_display or (email_clean if gravatar_found else None),
+                "profile_url": f"https://gravatar.com/{md5_hash}" if gravatar_found else f"https://gravatar.com/site/check/{md5_hash}",
+                "avatar_url": gravatar_avatar,
+                "details": f"Public avatar registered for {email_clean}" if gravatar_found else "No public Gravatar avatar associated",
+                "icon": "gravatar",
+            }
 
-        social_accounts.append({
-            "platform": "Gravatar",
-            "status": "found" if gravatar_found else "not_detected",
-            "verified": gravatar_found,
-            "username": gravatar_display or (email_clean if gravatar_found else None),
-            "profile_url": f"https://gravatar.com/{md5_hash}" if gravatar_found else f"https://gravatar.com/site/check/{md5_hash}",
-            "avatar_url": gravatar_avatar,
-            "details": f"Public avatar registered for {email_clean}" if gravatar_found else "No public Gravatar avatar associated",
-            "icon": "gravatar",
-        })
-
-        # 2. Duolingo (silent user API query)
-        duo_found = False
-        duo_user = None
-        duo_streak = 0
-        duo_pic = None
-        try:
-            resp = await client.get(
-                f"https://www.duolingo.com/2017-06-30/users?email={urllib.parse.quote(email_clean)}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=3.5,
-            )
-            if resp.status_code == 200:
-                users = resp.json().get("users", [])
-                if users:
-                    u = users[0]
-                    duo_found = True
-                    duo_user = u.get("username")
-                    duo_streak = u.get("streak", 0)
-                    pic = u.get("picture")
-                    if pic:
-                        duo_pic = f"https:{pic}" if pic.startswith("//") else pic
-        except Exception:
-            pass
-
-        social_accounts.append({
-            "platform": "Duolingo",
-            "status": "found" if duo_found else "not_detected",
-            "verified": duo_found,
-            "username": duo_user,
-            "profile_url": f"https://www.duolingo.com/profile/{duo_user}" if duo_user else "https://www.duolingo.com",
-            "avatar_url": duo_pic,
-            "details": f"Active learner (Streak: {duo_streak} days)" if duo_found else "No Duolingo account detected",
-            "icon": "duolingo",
-        })
-
-        # 3. GitHub (silent user/commit check)
-        gh_found = False
-        gh_user = None
-        gh_url = None
-        gh_avatar = None
-        try:
-            gh_resp = await client.get(
-                f"https://api.github.com/search/users?q={urllib.parse.quote(email_clean)}+in:email",
-                headers={"User-Agent": "FootprintHub-OSINT"},
-                timeout=3.5,
-            )
-            if gh_resp.status_code == 200 and gh_resp.json().get("total_count", 0) > 0:
-                item = gh_resp.json().get("items", [])[0]
-                gh_found = True
-                gh_user = item.get("login")
-                gh_url = item.get("html_url")
-                gh_avatar = item.get("avatar_url")
-            elif username:
-                # Check standard username
-                u_resp = await client.get(
-                    f"https://api.github.com/users/{username}",
-                    headers={"User-Agent": "FootprintHub-OSINT"},
-                    timeout=2.5,
+        async def _check_duolingo() -> dict[str, Any]:
+            duo_found = False
+            duo_user = None
+            duo_streak = 0
+            duo_pic = None
+            try:
+                resp = await client.get(
+                    f"https://www.duolingo.com/2017-06-30/users?email={urllib.parse.quote(email_clean)}",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=2.2,
                 )
-                if u_resp.status_code == 200:
-                    u_data = u_resp.json()
-                    gh_found = True
-                    gh_user = u_data.get("login")
-                    gh_url = u_data.get("html_url")
-                    gh_avatar = u_data.get("avatar_url")
-        except Exception:
-            pass
+                if resp.status_code == 200:
+                    users = resp.json().get("users", [])
+                    if users:
+                        u = users[0]
+                        duo_found = True
+                        duo_user = u.get("username")
+                        duo_streak = u.get("streak", 0)
+                        pic = u.get("picture")
+                        if pic:
+                            duo_pic = f"https:{pic}" if pic.startswith("//") else pic
+            except Exception:
+                pass
+            return {
+                "platform": "Duolingo",
+                "status": "found" if duo_found else "not_detected",
+                "verified": duo_found,
+                "username": duo_user,
+                "profile_url": f"https://www.duolingo.com/profile/{duo_user}" if duo_user else "https://www.duolingo.com",
+                "avatar_url": duo_pic,
+                "details": f"Active learner (Streak: {duo_streak} days)" if duo_found else "No Duolingo account detected",
+                "icon": "duolingo",
+            }
 
-        social_accounts.append({
-            "platform": "GitHub",
-            "status": "found" if gh_found else "query_ready",
-            "verified": gh_found,
-            "username": gh_user or username,
-            "profile_url": gh_url or f"https://github.com/search?q={urllib.parse.quote(email_clean)}&type=users",
-            "avatar_url": gh_avatar,
-            "details": f"GitHub profile linked: @{gh_user}" if gh_found else "Query target commits & public code repositories",
-            "icon": "github",
-        })
+        async def _check_github() -> dict[str, Any]:
+            gh_found = False
+            gh_user = None
+            gh_url = None
+            gh_avatar = None
+            try:
+                gh_resp = await client.get(
+                    f"https://api.github.com/search/users?q={urllib.parse.quote(email_clean)}+in:email",
+                    headers={"User-Agent": "FootprintHub-OSINT"},
+                    timeout=2.2,
+                )
+                if gh_resp.status_code == 200 and gh_resp.json().get("total_count", 0) > 0:
+                    item = gh_resp.json().get("items", [])[0]
+                    gh_found = True
+                    gh_user = item.get("login")
+                    gh_url = item.get("html_url")
+                    gh_avatar = item.get("avatar_url")
+                elif username:
+                    u_resp = await client.get(
+                        f"https://api.github.com/users/{username}",
+                        headers={"User-Agent": "FootprintHub-OSINT"},
+                        timeout=1.8,
+                    )
+                    if u_resp.status_code == 200:
+                        u_data = u_resp.json()
+                        gh_found = True
+                        gh_user = u_data.get("login")
+                        gh_url = u_data.get("html_url")
+                        gh_avatar = u_data.get("avatar_url")
+            except Exception:
+                pass
+            return {
+                "platform": "GitHub",
+                "status": "found" if gh_found else "query_ready",
+                "verified": gh_found,
+                "username": gh_user or username,
+                "profile_url": gh_url or f"https://github.com/search?q={urllib.parse.quote(email_clean)}&type=users",
+                "avatar_url": gh_avatar,
+                "details": f"GitHub profile linked: @{gh_user}" if gh_found else "Query target commits & public code repositories",
+                "icon": "github",
+            }
+
+        concurrent_checks = await asyncio.gather(
+            _check_gravatar(),
+            _check_duolingo(),
+            _check_github(),
+            return_exceptions=True,
+        )
+        for item in concurrent_checks:
+            if isinstance(item, dict):
+                social_accounts.append(item)
 
         # 4. LinkedIn (Profile & Professional Search)
         clean_name = full_name if full_name else username
@@ -626,12 +632,14 @@ class OSINTModule(BaseModule):
             # 1. Fetch homepage first to discover internal links dynamically (e.g. /about-us, /our-team)
             homepage_html = ""
             active_host = clean_target
+            active_scheme = "https"
             for probe_host in [clean_target, base_domain]:
                 try:
-                    resp = await client.get(f"https://{probe_host}/", timeout=6.0)
+                    resp = await client.get(f"https://{probe_host}/", timeout=5.0)
                     if resp.status_code == 200 and resp.text:
-                        homepage_html = resp.text
-                        active_host = probe_host
+                        homepage_html = resp.text[:400000]
+                        active_host = urllib.parse.urlparse(str(resp.url)).netloc or probe_host
+                        active_scheme = "https"
                         all_crawled_html += homepage_html + "\n"
                         break
                 except Exception:
@@ -639,16 +647,18 @@ class OSINTModule(BaseModule):
             if not homepage_html:
                 for probe_host in [clean_target, base_domain]:
                     try:
-                        resp = await client.get(f"http://{probe_host}/", timeout=6.0)
+                        resp = await client.get(f"http://{probe_host}/", timeout=5.0)
                         if resp.status_code == 200 and resp.text:
-                            homepage_html = resp.text
-                            active_host = probe_host
+                            homepage_html = resp.text[:400000]
+                            active_host = urllib.parse.urlparse(str(resp.url)).netloc or probe_host
+                            active_scheme = "http"
                             all_crawled_html += homepage_html + "\n"
                             break
                     except Exception:
                         pass
 
-            # Dynamically discover navigation links from homepage
+            # Dynamically discover navigation links from homepage (prioritize discovered routes FIRST)
+            discovered_paths: list[str] = []
             if homepage_html:
                 raw_hrefs = re.findall(r'href=["\']([^"\']+)["\']', homepage_html, re.I)
                 escaped_hrefs = re.findall(r'["\'](/[^"\']+|https?://[^"\']+)["\']', homepage_html)
@@ -664,28 +674,42 @@ class OSINTModule(BaseModule):
                             clean_href = "/" + clean_href
 
                         if clean_href.startswith("/") and not clean_href.startswith("//"):
-                            if clean_href not in paths_to_crawl:
-                                paths_to_crawl.append(clean_href)
+                            if clean_href not in discovered_paths and not any(clean_href.lower().endswith(ext) for ext in (".png", ".jpg", ".svg", ".css", ".js", ".pdf")):
+                                discovered_paths.append(clean_href)
                         elif clean_target in lower_link or base_domain in lower_link:
                             try:
                                 parsed = urllib.parse.urlparse(raw_link)
-                                if parsed.path and parsed.path not in paths_to_crawl:
-                                    paths_to_crawl.append(parsed.path)
+                                if parsed.path and parsed.path not in discovered_paths and not any(parsed.path.lower().endswith(ext) for ext in (".png", ".jpg", ".svg", ".css", ".js", ".pdf")):
+                                    discovered_paths.append(parsed.path)
                             except Exception:
                                 pass
 
-            # Filter unique non-empty paths and crawl concurrently
-            remaining_paths = [p for p in dict.fromkeys(paths_to_crawl) if p != ""][:20]
+            # Quick sitemap.xml check for high-signal about/team/leadership routes
+            try:
+                sm_resp = await client.get(f"{active_scheme}://{active_host}/sitemap.xml", timeout=2.5)
+                if sm_resp.status_code == 200 and "<loc>" in sm_resp.text:
+                    for loc in re.findall(r"<loc>(https?://[^<]+)</loc>", sm_resp.text, re.I):
+                        if any(kw in loc.lower() for kw in ["about", "team", "leader", "founder", "company", "who-we-are", "contact"]):
+                            p_sm = urllib.parse.urlparse(loc).path
+                            if p_sm and p_sm not in discovered_paths:
+                                discovered_paths.append(p_sm)
+                                if len(discovered_paths) >= 10:
+                                    break
+            except Exception:
+                pass
+
+            # Put dynamically discovered paths BEFORE generic guesses; limit total sub-pages for speed
+            merged_paths = discovered_paths + [p for p in paths_to_crawl if p not in discovered_paths]
+            remaining_paths = [p for p in dict.fromkeys(merged_paths) if p not in ("", "/")][:12]
 
             async def _crawl_path(path: str) -> str:
-                for scheme in ["https", "http"]:
-                    try:
-                        url = f"{scheme}://{active_host}{path}"
-                        resp = await client.get(url, timeout=5.0)
-                        if resp.status_code == 200 and resp.text:
-                            return resp.text
-                    except Exception:
-                        pass
+                try:
+                    url = f"{active_scheme}://{active_host}{path}"
+                    resp = await client.get(url, timeout=3.2)
+                    if resp.status_code == 200 and resp.text:
+                        return resp.text[:250000]
+                except Exception:
+                    pass
                 return ""
 
             if remaining_paths:
@@ -693,6 +717,27 @@ class OSINTModule(BaseModule):
                 for h_text in results_batch:
                     if h_text:
                         all_crawled_html += h_text + "\n"
+
+            # Optional WordPress public users API discovery if WordPress markers detected
+            wp_users_found: list[dict[str, Any]] = []
+            if "wp-content" in all_crawled_html or "wp-json" in all_crawled_html:
+                try:
+                    wp_r = await client.get(f"{active_scheme}://{active_host}/wp-json/wp/v2/users?per_page=8", timeout=3.0)
+                    if wp_r.status_code == 200 and isinstance(wp_r.json(), list):
+                        for wp_u in wp_r.json():
+                            wp_name = (wp_u.get("name") or "").strip()
+                            if 2 <= len(wp_name.split()) <= 4 and not any(bad in wp_name.lower() for bad in ["admin", "editor", "author", "test", "support"]):
+                                wp_users_found.append({
+                                    "name": wp_name,
+                                    "title": "Author / Contributor (WordPress)",
+                                    "department": "Engineering & Tech",
+                                    "linkedin_url": "",
+                                    "avatar_url": (wp_u.get("avatar_urls") or {}).get("96"),
+                                    "bio": wp_u.get("description") or f"Published author on {clean_target}",
+                                    "source": "WordPress Public API (/wp-json/wp/v2/users)",
+                                })
+                except Exception:
+                    pass
 
             # ── 2. SPA JS Bundle & Lazy Chunk Crawling (React / Vite / Next.js / Vue) ──
             crawled_js_list: list[str] = []
@@ -713,31 +758,31 @@ class OSINTModule(BaseModule):
                     if not raw_src or any(n in raw_src.lower() for n in third_party_noise):
                         continue
                     if raw_src.startswith("//"):
-                        js_url = f"https:{raw_src}"
+                        js_url = f"{active_scheme}:{raw_src}"
                     elif raw_src.startswith("/"):
-                        js_url = f"https://{active_host}{raw_src}"
+                        js_url = f"{active_scheme}://{active_host}{raw_src}"
                     elif raw_src.startswith("http"):
                         parsed_js = urllib.parse.urlparse(raw_src)
                         if base_domain not in parsed_js.netloc.lower():
                             continue
                         js_url = raw_src
                     else:
-                        js_url = f"https://{active_host}/{raw_src}"
+                        js_url = f"{active_scheme}://{active_host}/{raw_src}"
                     if js_url not in seen_js_urls:
                         seen_js_urls.add(js_url)
                         entry_js_candidates.append(js_url)
 
                 async def _fetch_js(url: str) -> tuple[str, str]:
                     try:
-                        r = await client.get(url, timeout=6.0)
+                        r = await client.get(url, timeout=4.0)
                         if r.status_code == 200 and r.text:
-                            return (url, r.text)
+                            return (url, r.text[:800000])
                     except Exception:
                         pass
                     return (url, "")
 
                 if entry_js_candidates:
-                    entry_results = await asyncio.gather(*[_fetch_js(u) for u in entry_js_candidates[:8]])
+                    entry_results = await asyncio.gather(*[_fetch_js(u) for u in entry_js_candidates[:6]])
                     lazy_chunk_candidates: list[str] = []
                     high_signal_kw = (
                         "about", "team", "leader", "founder", "people", "contact",
@@ -755,15 +800,15 @@ class OSINTModule(BaseModule):
                             if ch_ref.startswith("./"):
                                 ch_url = f"{base_dir}/{ch_ref[2:]}"
                             elif ch_ref.startswith("/"):
-                                ch_url = f"https://{active_host}{ch_ref}"
+                                ch_url = f"{active_scheme}://{active_host}{ch_ref}"
                             else:
-                                ch_url = f"https://{active_host}/{ch_ref}"
+                                ch_url = f"{active_scheme}://{active_host}/{ch_ref}"
                             if ch_url not in seen_js_urls and any(kw in ch_ref.lower() for kw in high_signal_kw):
                                 seen_js_urls.add(ch_url)
                                 lazy_chunk_candidates.append(ch_url)
 
                     if lazy_chunk_candidates:
-                        chunk_results = await asyncio.gather(*[_fetch_js(u) for u in lazy_chunk_candidates[:18]])
+                        chunk_results = await asyncio.gather(*[_fetch_js(u) for u in lazy_chunk_candidates[:12]])
                         for _, ch_body in chunk_results:
                             if ch_body:
                                 crawled_js_list.append(ch_body)
@@ -817,18 +862,57 @@ class OSINTModule(BaseModule):
             )
             if company_meta.get("name") and company_meta["name"] != company_name:
                 company_name = company_meta["name"]
+            if wp_users_found:
+                existing_team_names = {t.get("name", "").lower() for t in company_meta.get("scraped_team", [])}
+                for wp_u in wp_users_found:
+                    if wp_u["name"].lower() not in existing_team_names:
+                        company_meta.setdefault("scraped_team", []).append(wp_u)
 
             # If company description is sparse, fallback to extracted About narrative
             if company_meta.get("about_company") and (not company_meta.get("description") or len(company_meta.get("description", "")) < 30):
                 company_meta["description"] = company_meta["about_company"]
 
-            # Query open knowledge repositories (Wikipedia, Wikidata & public graphs)
+            # Query Wikipedia/Wikidata AND live online web search in parallel (bounded timeout)
             wiki_intel: dict[str, Any] = {}
+            online_intel: dict[str, Any] = {}
             try:
-                self._progress(on_progress, 28, f"Querying Wikipedia & Wikidata for {company_name}...")
-                wiki_intel = await PublicKnowledgeHarvester.harvest_public_knowledge(
-                    company_name, base_domain, client=client, legal_name=company_meta.get("legal_name", "")
+                self._progress(on_progress, 28, f"Digging Wikipedia, Wikidata & live online sources for {company_name}...")
+                wiki_task = asyncio.wait_for(
+                    PublicKnowledgeHarvester.harvest_public_knowledge(
+                        company_name, base_domain, client=client, legal_name=company_meta.get("legal_name", "")
+                    ),
+                    timeout=8.0,
                 )
+                online_task = asyncio.wait_for(
+                    PublicKnowledgeHarvester.dig_online_intelligence(
+                        company_name, base_domain, client=client
+                    ),
+                    timeout=7.5,
+                )
+                res_wiki, res_online = await asyncio.gather(wiki_task, online_task, return_exceptions=True)
+                if isinstance(res_wiki, dict):
+                    wiki_intel = res_wiki
+                if isinstance(res_online, dict):
+                    online_intel = res_online
+
+                # If primary Wikipedia search missed the company article, probe any Wikipedia titles discovered by live web search
+                if wiki_intel.get("wikipedia_status") != "found" and online_intel.get("wikipedia_titles"):
+                    try:
+                        fallback_wiki = await asyncio.wait_for(
+                            PublicKnowledgeHarvester.inspect_wikipedia_titles(
+                                online_intel["wikipedia_titles"],
+                                company_name,
+                                base_domain,
+                                client=client,
+                            ),
+                            timeout=4.5,
+                        )
+                        if isinstance(fallback_wiki, dict) and fallback_wiki.get("wikipedia_status") == "found":
+                            wiki_intel = fallback_wiki
+                    except Exception:
+                        pass
+
+                # Merge Wikipedia company data
                 if wiki_intel.get("description") and not company_meta.get("description"):
                     company_meta["description"] = wiki_intel["description"]
                 if wiki_intel.get("industry") and (not company_meta.get("industry") or company_meta.get("industry") == "Technology & Software"):
@@ -856,16 +940,42 @@ class OSINTModule(BaseModule):
                         company_meta.setdefault("founders", []).insert(0, f)
                 if wiki_intel.get("candidate_slugs"):
                     company_meta.setdefault("candidate_slugs", []).extend(wiki_intel["candidate_slugs"])
+
+                # Merge live online search intelligence (founders, social profiles, LinkedIn company URL)
+                for f_on in online_intel.get("founders", []):
+                    existing = next((ef for ef in company_meta.get("founders", []) if ef.get("name", "").lower() == f_on.get("name", "").lower()), None)
+                    if existing:
+                        if f_on.get("linkedin_url") and not existing.get("linkedin_url"):
+                            existing["linkedin_url"] = f_on["linkedin_url"]
+                        if f_on.get("bio") and len(existing.get("bio", "")) < 40:
+                            existing["bio"] = f_on["bio"]
+                    else:
+                        company_meta.setdefault("founders", []).append(f_on)
+
+                existing_soc_keys = {f"{s['platform']}:{s['handle'].lower()}" for s in website_social_profiles}
+                for s_on in online_intel.get("social_profiles", []):
+                    sk = f"{s_on['platform']}:{s_on['handle'].lower()}"
+                    if sk not in existing_soc_keys:
+                        existing_soc_keys.add(sk)
+                        website_social_profiles.append(s_on)
+
+                if online_intel.get("linkedin_company_url"):
+                    li_slug = online_intel["linkedin_company_url"].rstrip("/").split("/")[-1]
+                    if li_slug and li_slug not in company_meta.get("candidate_slugs", []):
+                        company_meta.setdefault("candidate_slugs", []).append(li_slug)
             except Exception:
                 pass
 
-            # Enrich discovered founders via Wikipedia person profiles and portrait lookup
+            # Enrich discovered founders via Wikipedia person profiles and portrait lookup (bounded timeout)
             if company_meta.get("founders"):
                 async def _enrich_founder(f_obj: dict[str, Any]) -> None:
                     try:
                         if not f_obj.get("wikipedia_url"):
-                            p_prof = await PublicKnowledgeHarvester.enrich_person_profile(
-                                f_obj["name"], company_name, domain=base_domain, client=client
+                            p_prof = await asyncio.wait_for(
+                                PublicKnowledgeHarvester.enrich_person_profile(
+                                    f_obj["name"], company_name, domain=base_domain, client=client
+                                ),
+                                timeout=5.5,
                             )
                             if isinstance(p_prof, dict):
                                 for k in ("wikipedia_url", "bio_summary"):
@@ -884,19 +994,28 @@ class OSINTModule(BaseModule):
                                     f_obj["photo_url"] = p_prof["photo_url"]
                                     f_obj["avatar_url"] = p_prof["photo_url"]
                         if not f_obj.get("photo_url"):
-                            f_img = await PublicKnowledgeHarvester.search_person_image(f_obj["name"], company_name, client=client)
+                            f_img = await asyncio.wait_for(
+                                PublicKnowledgeHarvester.search_person_image(f_obj["name"], company_name, client=client),
+                                timeout=4.5,
+                            )
                             if f_img:
                                 f_obj["photo_url"] = f_img
                                 f_obj["avatar_url"] = f_img
                     except Exception:
                         pass
 
-                await asyncio.gather(*[_enrich_founder(f) for f in company_meta["founders"][:4]])
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*[_enrich_founder(f) for f in company_meta["founders"][:3]]),
+                        timeout=7.5,
+                    )
+                except Exception:
+                    pass
 
             # Fallback founded_year from RDAP domain registration if still missing
             if not company_meta.get("founded_year"):
                 try:
-                    rdap_info = await RDAPService.query_rdap(base_domain, client=client)
+                    rdap_info = await asyncio.wait_for(RDAPService.query_rdap(base_domain, client=client), timeout=4.0)
                     if rdap_info.get("registered_date"):
                         ym = re.search(r"(19\d\d|20\d\d)", str(rdap_info["registered_date"]))
                         if ym:
@@ -914,10 +1033,16 @@ class OSINTModule(BaseModule):
             github_handles = [p["handle"] for p in website_social_profiles if p["platform"] == "GitHub"]
             if github_handles:
                 self._progress(on_progress, 32, f"Gathering GitHub intelligence for @{github_handles[0]}...")
-                github_intel = await SocialMediaScraper.gather_github_intelligence(
-                    github_handles[0], client,
-                    github_token=getattr(settings, "GITHUB_TOKEN", None),
-                )
+                try:
+                    github_intel = await asyncio.wait_for(
+                        SocialMediaScraper.gather_github_intelligence(
+                            github_handles[0], client,
+                            github_token=getattr(settings, "GITHUB_TOKEN", None),
+                        ),
+                        timeout=4.5,
+                    )
+                except Exception:
+                    github_intel = {}
                 if github_intel.get("members"):
                     findings.append(
                         ModuleFinding(
@@ -974,17 +1099,17 @@ class OSINTModule(BaseModule):
 
             self._progress(on_progress, 52, "Executing Behind the Email profile enrichment & social discovery...")
 
-            # Run Behind the Email engine on the discovered emails concurrently
+            # Run Behind the Email engine on the discovered emails concurrently (bounded to 4 emails / 6.5s)
             behind_the_email_profiles: list[dict[str, Any]] = []
             enrichment_tasks = [
                 BehindTheEmailEngine.enrich_email(em, company_hint=company_name)
-                for em in list(emails_found)[:6]
+                for em in list(emails_found)[:4]
             ]
             if enrichment_tasks:
                 try:
                     results = await asyncio.wait_for(
                         asyncio.gather(*enrichment_tasks, return_exceptions=True),
-                        timeout=12.0,
+                        timeout=6.5,
                     )
                     for res in results:
                         if isinstance(res, dict):
@@ -1026,15 +1151,28 @@ class OSINTModule(BaseModule):
             self._progress(on_progress, 72, "Compiling LinkedIn Corporate Intelligence, Employee Directory & Founders...")
 
             # ── LinkedIn Corporate Intelligence Engine ──────────────────────────
-            linkedin_intelligence = await LinkedInOSINTEngine.fetch_and_build_linkedin_intelligence(
-                domain=base_domain,
-                company_name=company_name,
-                website_social_profiles=website_social_profiles,
-                company_meta=company_meta,
-                github_intel=github_intel,
-                enriched_email_profiles=behind_the_email_profiles,
-                client=client,
-            )
+            try:
+                linkedin_intelligence = await asyncio.wait_for(
+                    LinkedInOSINTEngine.fetch_and_build_linkedin_intelligence(
+                        domain=base_domain,
+                        company_name=company_name,
+                        website_social_profiles=website_social_profiles,
+                        company_meta=company_meta,
+                        github_intel=github_intel,
+                        enriched_email_profiles=behind_the_email_profiles,
+                        client=client,
+                    ),
+                    timeout=8.0,
+                )
+            except Exception:
+                linkedin_intelligence = LinkedInOSINTEngine.build_linkedin_intelligence(
+                    domain=base_domain,
+                    company_name=company_name,
+                    website_social_profiles=website_social_profiles,
+                    company_meta=company_meta,
+                    github_intel=github_intel,
+                    enriched_email_profiles=behind_the_email_profiles,
+                )
 
             # ── Digital Footprint & Registries Engine ───────────────────────────
             self._progress(on_progress, 78, "Aggregating public registers and corporate digital footprint...")
@@ -1165,6 +1303,7 @@ class OSINTModule(BaseModule):
                     "company_name": company_name,
                     "company_metadata": company_meta,
                     "public_knowledge": wiki_intel,
+                    "online_search": online_intel,
                     "digital_footprint": digital_footprint,
                     "internet_intelligence": internet_intelligence,
                     "linkedin_intelligence": linkedin_intelligence,
