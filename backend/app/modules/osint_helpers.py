@@ -3241,6 +3241,8 @@ class LinkedInOSINTEngine:
             "logo_url": None,
             "industry": "",
             "headquarters": "",
+            "founded_year": "",
+            "specialties": "",
             "estimated_employees": "",
         }
 
@@ -3261,12 +3263,36 @@ class LinkedInOSINTEngine:
 
         og_img = soup.find("meta", property="og:image")
         if og_img and og_img.get("content"):
-            meta_info["logo_url"] = og_img["content"].strip()
+            og_img_url = og_img["content"].strip()
+            if "static.licdn.com" not in og_img_url.lower():
+                meta_info["logo_url"] = og_img_url
 
         if not meta_info["followers"]:
             fol_m = re.search(r"([0-9,]+)\s+followers", html_text, re.I)
             if fol_m:
                 meta_info["followers"] = fol_m.group(1)
+
+        # 1b. Parse public LinkedIn guest <dl> company facts (Industry, Company size, Headquarters, Founded, Specialties)
+        for dl in soup.find_all("dl"):
+            for dt in dl.find_all("dt"):
+                dd = dt.find_next_sibling("dd")
+                if not dd:
+                    continue
+                k_txt = dt.get_text(" ", strip=True).lower()
+                v_txt = dd.get_text(" ", strip=True).strip()
+                if not v_txt:
+                    continue
+                if "industry" in k_txt and not meta_info["industry"]:
+                    meta_info["industry"] = v_txt
+                elif "company size" in k_txt or k_txt == "size":
+                    meta_info["estimated_employees"] = v_txt
+                elif "headquarters" in k_txt and not meta_info["headquarters"]:
+                    meta_info["headquarters"] = v_txt
+                elif "founded" in k_txt and not meta_info["founded_year"]:
+                    fy_m = re.search(r"(1[89]\d\d|20[0-2]\d)", v_txt)
+                    meta_info["founded_year"] = fy_m.group(1) if fy_m else v_txt[:20]
+                elif "specialties" in k_txt and not meta_info["specialties"]:
+                    meta_info["specialties"] = v_txt[:300]
 
         if not meta_info["estimated_employees"]:
             emp_m = re.search(
@@ -3293,10 +3319,10 @@ class LinkedInOSINTEngine:
                             meta_info["title"] = str(item["name"]).strip()
                         if item.get("description") and not meta_info["description"]:
                             meta_info["description"] = str(item["description"]).strip()
-                        if item.get("numberOfEmployees"):
+                        if item.get("numberOfEmployees") and not meta_info["estimated_employees"]:
                             ne = item["numberOfEmployees"]
                             meta_info["estimated_employees"] = str(ne.get("value", ne) if isinstance(ne, dict) else ne)
-                        if item.get("address"):
+                        if item.get("address") and not meta_info["headquarters"]:
                             addr = item["address"]
                             if isinstance(addr, dict):
                                 parts = [addr.get("addressLocality"), addr.get("addressCountry")]
@@ -3323,9 +3349,25 @@ class LinkedInOSINTEngine:
             seen_slugs.add(slug_key)
 
             clean_url = f"https://www.linkedin.com/in/{slug}"
+            parent = a.find_parent("li") or a.find_parent(["div", "article", "section", "p"])
+            parent_text = parent.get_text(" ", strip=True) if parent else ""
+
+            # Prefer explicit LinkedIn card title tag before generic anchor text or slug fallback
+            card_title_el = (
+                a.find(["h3", "span"], class_=re.compile(r"base-main-card__title", re.I))
+                or (parent.find(["h3", "span"], class_=re.compile(r"base-main-card__title", re.I)) if parent else None)
+            )
+            card_sub_el = (
+                a.find(["h4", "p", "span"], class_=re.compile(r"base-main-card__subtitle", re.I))
+                or (parent.find(["h4", "p", "span"], class_=re.compile(r"base-main-card__subtitle", re.I)) if parent else None)
+            )
+            title_candidate = card_title_el.get_text(" ", strip=True) if card_title_el else ""
+            subtitle_candidate = card_sub_el.get_text(" ", strip=True) if card_sub_el else ""
 
             raw_text = a.get_text(" ", strip=True)
-            if (
+            if title_candidate and 1 <= len(title_candidate.split()) <= 5:
+                name = title_candidate
+            elif (
                 raw_text
                 and 1 < len(raw_text.split()) <= 4
                 and not any(w in raw_text.lower() for w in ["view", "more", "profile", "connect", "follow", "see", "join"])
@@ -3334,29 +3376,41 @@ class LinkedInOSINTEngine:
             else:
                 name = CompanyMetadataScraper.clean_slug_to_name(slug)
 
-            parent = a.find_parent(["div", "li", "article", "section", "p"])
-            parent_text = parent.get_text(" ", strip=True) if parent else ""
-
-            # Avatar image
+            # Avatar image (prefer data-delayed-url / real media URLs, ignore data: and static ghost placeholders)
             img = a.find("img") or (parent.find("img") if parent else None)
             avatar = None
             if img:
-                avatar = img.get("src") or img.get("data-delayed-url")
-                if avatar and avatar.startswith("data:"):
-                    avatar = None
+                for attr_name in ("data-delayed-url", "src", "data-src"):
+                    cand_img = (img.get(attr_name) or "").strip()
+                    if (
+                        cand_img
+                        and not cand_img.startswith("data:")
+                        and "static.licdn.com" not in cand_img.lower()
+                        and "ghost" not in cand_img.lower()
+                    ):
+                        avatar = cand_img
+                        break
 
-            is_direct_employee = "org-employees" in href or "employee" in href.lower()
+            tracking_ctrl = (a.get("data-tracking-control-name") or "").lower()
+            is_direct_employee = (
+                "org-employees" in href.lower()
+                or "org-employees" in tracking_ctrl
+                or "employee" in href.lower()
+            )
 
             title = "Company Employee" if is_direct_employee else "Staff / Team Member"
-            role_m = re.search(
-                r"\b((?:Co-)?Founder(?:\s*(?:&|and)\s*[\w\s]+)?|CEO|CTO|COO|CFO|CISO|President|Managing Director|Director|VP|Lead\s+[\w\s]+|Senior\s+[\w\s]+|Software\s+[\w\s]+|Engineer|Analyst|Consultant|Developer|Designer|Educator|Instructor|Manager|Specialist)\b",
-                parent_text,
-                re.I,
-            )
-            if role_m:
-                title = role_m.group(0).strip().title()
-            elif not is_direct_employee:
-                title = "Associated Professional / Follower"
+            if subtitle_candidate and 2 <= len(subtitle_candidate) <= 100 and subtitle_candidate.lower() != name.lower():
+                title = subtitle_candidate
+            else:
+                role_m = re.search(
+                    r"\b((?:Co-)?Founder(?:\s*(?:&|and)\s*[\w\s]+)?|CEO|CTO|COO|CFO|CISO|President|Managing Director|Director|VP|Lead\s+[\w\s]+|Senior\s+[\w\s]+|Software\s+[\w\s]+|Engineer|Analyst|Consultant|Developer|Designer|Educator|Instructor|Manager|Specialist)\b",
+                    parent_text,
+                    re.I,
+                )
+                if role_m:
+                    title = role_m.group(0).strip().title()
+                elif not is_direct_employee:
+                    title = "Associated Professional / Follower"
 
             # Department & Executive classification
             # If not direct employee, they are a follower or mention, never executive leadership
@@ -3376,9 +3430,9 @@ class LinkedInOSINTEngine:
                 dept = "Operations & Business"
                 is_exec = False
 
-            first_n = name.split()[0].lower() if name.split() else "user"
-            last_n = name.split()[-1].lower() if len(name.split()) > 1 else "name"
-            inferred_email = f"{first_n}.{last_n}@{clean_domain}"
+            first_n = re.sub(r"[^a-z0-9]", "", name.split()[0].lower()) if name.split() else "user"
+            last_n = re.sub(r"[^a-z0-9]", "", name.split()[-1].lower()) if len(name.split()) > 1 else "name"
+            inferred_email = f"{first_n or 'user'}.{last_n or 'name'}@{clean_domain}"
 
             employees.append(
                 {
@@ -3388,9 +3442,12 @@ class LinkedInOSINTEngine:
                     "linkedin_url": clean_url,
                     "linkedin_search_url": f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(name + ' ' + company_name)}",
                     "avatar_url": avatar,
+                    "photo_url": avatar,
                     "inferred_email": inferred_email,
                     "bio": f"Associated with {company_name} on LinkedIn ({'Current Organization Employee' if is_direct_employee else 'LinkedIn Follower & Mention'})",
                     "source": "LinkedIn Company Page (" + ("Employee Directory" if is_direct_employee else "Mentions & Followers") + ")",
+                    "sources": ["LinkedIn Public Company Page"],
+                    "confidence": "HIGH" if is_direct_employee else "MEDIUM",
                     "is_verified": True,
                     "is_founder": is_exec,
                     "risk_level": "High Risk: Primary Target for Spear-Phishing & BEC" if is_exec else "Elevated: Public Identity Exposes Organization Footprint",
@@ -3502,15 +3559,31 @@ class LinkedInOSINTEngine:
         company_details: dict[str, Any] = {}
 
         # Query public LinkedIn company page via SSRF-safe request
-        for target_url in urls_to_try[:3]:
+        for target_url in urls_to_try[:4]:
             resp = await safe_osint_request("GET", target_url, client=client, timeout=6.0, retries=0, cache_ttl=1800.0)
             if resp is not None and getattr(resp, "status_code", 0) == 200 and getattr(resp, "text", "") and len(resp.text) > 2000:
-                if "authwall" in resp.text.lower() or "session_key" in resp.text.lower():
+                final_url_lower = str(getattr(resp, "url", target_url) or target_url).lower()
+                if "/uas/login" in final_url_lower or "/authwall" in final_url_lower:
+                    continue
+                resp_lower = resp.text.lower()
+                has_public_content = (
+                    "org-employees" in resp_lower
+                    or "linkedin.com/in/" in resp_lower
+                    or "<dl" in resp_lower
+                )
+                # Note: public LinkedIn guest company pages embed sign-in modal strings ("authwall"/"session_key")
+                # in the footer even when full company metadata and org-employees cards are served.
+                if not has_public_content and ("authwall" in resp_lower or "session_key" in resp_lower):
                     continue
                 company_url = str(getattr(resp, "url", target_url) or target_url).rstrip("/")
                 company_slug = company_url.split("/")[-1].split("?")[0]
                 c_meta, c_emps = cls.parse_linkedin_company_html(resp.text, clean_domain, company_name)
                 company_details = c_meta
+                for emp_item in c_emps:
+                    emp_item.setdefault(
+                        "source_references",
+                        [{"label": "LinkedIn Company Page", "url": company_url}],
+                    )
                 crawled_employees.extend(c_emps)
                 if not any(p.get("platform") == "LinkedIn" and p.get("type") == "company" for p in website_social_profiles):
                     website_social_profiles.append({

@@ -342,6 +342,77 @@ class TestOSINTUpgrade(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_linkedin_guest_company_page_extracts_employees_and_dl_metadata_despite_footer_authwall(self):
+        guest_html = (
+            """
+            <html>
+              <head>
+                <meta property="og:title" content="BCBUZZ Technologies | LinkedIn">
+                <meta property="og:description" content="BCBUZZ Technologies | 4,100 followers on LinkedIn.">
+                <meta property="og:image" content="https://media.licdn.com/dms/image/company-logo.jpg">
+              </head>
+              <body>
+                <dl>
+                  <div><dt>Industry</dt><dd>Software Development</dd></div>
+                  <div><dt>Company size</dt><dd>2-10 employees</dd></div>
+                  <div><dt>Headquarters</dt><dd>COIMBATORE</dd></div>
+                  <div><dt>Founded</dt><dd>2021</dd></div>
+                </dl>
+                <ul>
+                  <li>
+                    <a data-tracking-control-name="org-employees" href="https://in.linkedin.com/in/madhan-balachandramohan-208b8911?trk=org-employees">
+                      <img data-delayed-url="https://media.licdn.com/dms/image/madhan.jpg" src="data:image/gif;base64,R0lGODlhAQAB" />
+                      <h3 class="base-main-card__title">Madhan Balachandramohan</h3>
+                      <h4 class="base-main-card__subtitle">Founder &amp; CEO</h4>
+                    </a>
+                  </li>
+                  <li>
+                    <a data-tracking-control-name="org-employees" href="https://in.linkedin.com/in/maharaj-m?trk=org-employees">
+                      <img data-delayed-url="https://static.licdn.com/aero-v1/sc/h/ghost-person.svg" />
+                      <h3 class="base-main-card__title">Maharaj M</h3>
+                      <h4 class="base-main-card__subtitle">Security Engineer</h4>
+                    </a>
+                  </li>
+                </ul>
+                <footer>Sign in authwall session_key footer script</footer>
+              </body>
+            </html>
+            """
+            + (" " * 2000)
+        )
+
+        async def _mock_req(method, url, **kwargs):
+            if "linkedin.com/company/bcbuzz" in url:
+                return _MockResponse(200, text=guest_html, url="https://www.linkedin.com/company/bcbuzz")
+            return _MockResponse(404, text="")
+
+        async def _run():
+            with patch("app.modules.osint_helpers.safe_osint_request", side_effect=_mock_req):
+                res = await LinkedInOSINTEngine.fetch_and_build_linkedin_intelligence(
+                    domain="bcbuzz.io",
+                    company_name="BCBUZZ",
+                    website_social_profiles=[{"platform": "LinkedIn", "handle": "bcbuzz", "url": "https://www.linkedin.com/company/bcbuzz", "type": "company"}],
+                    company_meta={},
+                    github_intel={},
+                    enriched_email_profiles=[],
+                )
+            self.assertEqual(res["reported_employee_count"], "2-10 employees")
+            self.assertEqual(res["company_details"]["headquarters"], "COIMBATORE")
+            self.assertEqual(res["company_details"]["founded_year"], "2021")
+            self.assertEqual(res["company_details"]["industry"], "Software Development")
+            names = [e["name"] for e in res["employees"]]
+            self.assertIn("Madhan Balachandramohan", names)
+            self.assertIn("Maharaj M", names)
+            madhan = next(e for e in res["employees"] if e["name"] == "Madhan Balachandramohan")
+            self.assertEqual(madhan["photo_url"], "https://media.licdn.com/dms/image/madhan.jpg")
+            self.assertEqual(madhan["confidence"], "HIGH")
+            self.assertEqual(madhan["department"], "Executive Leadership")
+            maharaj = next(e for e in res["employees"] if e["name"] == "Maharaj M")
+            self.assertIsNone(maharaj["photo_url"])
+            self.assertEqual(maharaj["department"], "Cybersecurity & IT")
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

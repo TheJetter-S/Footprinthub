@@ -1336,6 +1336,21 @@ class OSINTModule(BaseModule):
                     wiki_intel=wiki_intel,
                 )
 
+            # Merge verified public LinkedIn company metadata (Headquarters, Founded, Company size, Industry, Logo)
+            li_details = linkedin_intelligence.get("company_details") or {}
+            if li_details.get("headquarters") and not company_meta.get("headquarters"):
+                company_meta["headquarters"] = li_details["headquarters"]
+            if li_details.get("founded_year") and not company_meta.get("founded_year"):
+                company_meta["founded_year"] = li_details["founded_year"]
+            if li_details.get("industry") and (
+                not company_meta.get("industry") or company_meta.get("industry") == "Technology & Software"
+            ):
+                company_meta["industry"] = li_details["industry"]
+            if li_details.get("estimated_employees"):
+                company_meta["estimated_employees"] = li_details["estimated_employees"]
+            if li_details.get("logo_url") and not company_meta.get("logo"):
+                company_meta["logo"] = li_details["logo_url"]
+
             # ── Digital Footprint & Registries Engine ───────────────────────────
             self._progress(on_progress, 78, "Aggregating public registers and corporate digital footprint...")
             digital_footprint = CompanyDigitalFootprintEngine.build_digital_footprint(
@@ -1465,6 +1480,8 @@ class OSINTModule(BaseModule):
                 org_sources.append(wiki_intel["source_url"])
             if wiki_intel.get("wikidata_url") or company_meta.get("wikidata_url"):
                 org_sources.append(wiki_intel.get("wikidata_url") or company_meta.get("wikidata_url"))
+            if linkedin_intelligence.get("company_details") and linkedin_intelligence.get("company_url"):
+                org_sources.append(linkedin_intelligence["company_url"])
             if rdap_info.get("registrar"):
                 org_sources.append(f"https://rdap.org/domain/{base_domain}")
 
