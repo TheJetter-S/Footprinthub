@@ -1273,6 +1273,7 @@ function OSINTResultView({ data }: { data: any }) {
   const profiles: any[] = data.behind_the_email || []
   const linkedinIntel: any = data.linkedin_intelligence || {}
   const companyMeta: any = data.company_metadata || {}
+  const publicKnowledge: any = data.public_knowledge || {}
   const digitalFootprint: any = data.digital_footprint || {}
   const founders: any[] = data.founders || linkedinIntel.founders || []
   const employees: any[] = data.employees || linkedinIntel.employees || []
@@ -1343,6 +1344,16 @@ function OSINTResultView({ data }: { data: any }) {
                     <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-400 border border-emerald-500/20">
                       ✓ Schema.org Verified
                     </span>
+                  )}
+                  {(publicKnowledge.source_url || companyMeta.wikipedia_url) && (
+                    <a
+                      href={publicKnowledge.source_url || companyMeta.wikipedia_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-2 py-0.5 text-[10px] font-semibold text-blue-300 border border-blue-500/25 hover:bg-blue-500/20 transition-colors"
+                    >
+                      🌐 Wikipedia Verified <ExternalLink className="h-2.5 w-2.5" />
+                    </a>
                   )}
                 </div>
                 <p className="mt-1 text-xs text-surface-400 max-w-2xl leading-relaxed">
@@ -1493,19 +1504,31 @@ function OSINTResultView({ data }: { data: any }) {
                 </span>
               </h3>
               <p className="text-xs text-surface-400 mt-0.5">
-                Real individuals and key decision makers extracted directly from website HTML, LinkedIn profile links, and structured schema.
+                Real individuals and key decision makers extracted from website HTML/JS, LinkedIn, Wikipedia & open knowledge sources.
               </p>
             </div>
-            {linkedinIntel.company_url && (
-              <a
-                href={linkedinIntel.company_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600/20 text-blue-300 border border-blue-500/30 text-xs font-semibold hover:bg-blue-600/30 transition-all"
-              >
-                💼 Official LinkedIn Page <ExternalLink className="h-3 w-3" />
-              </a>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {(publicKnowledge.source_url || companyMeta.wikipedia_url) && (
+                <a
+                  href={publicKnowledge.source_url || companyMeta.wikipedia_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-purple-600/20 text-purple-300 border border-purple-500/30 text-xs font-semibold hover:bg-purple-600/30 transition-all"
+                >
+                  🌐 Wikipedia Dossier <ExternalLink className="h-3 w-3" />
+                </a>
+              )}
+              {linkedinIntel.company_url && (
+                <a
+                  href={linkedinIntel.company_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600/20 text-blue-300 border border-blue-500/30 text-xs font-semibold hover:bg-blue-600/30 transition-all"
+                >
+                  💼 Official LinkedIn Page <ExternalLink className="h-3 w-3" />
+                </a>
+              )}
+            </div>
           </div>
 
           {founders.length === 0 ? (
@@ -1514,9 +1537,9 @@ function OSINTResultView({ data }: { data: any }) {
                 🔍
               </div>
               <div className="space-y-1">
-                <h4 className="text-sm font-bold text-white">No Public Executive Profiles Declared in Website HTML</h4>
+                <h4 className="text-sm font-bold text-white">No Public Executive Profiles Declared on Target Pages</h4>
                 <p className="text-xs text-surface-400 max-w-md mx-auto leading-relaxed">
-                  The scanned public pages for <span className="text-brand-300 font-mono">{targetDomain}</span> do not explicitly list founder or owner names in their markup.
+                  The scanned public pages and Wikipedia registries for <span className="text-brand-300 font-mono">{targetDomain}</span> do not explicitly list founder or owner names.
                 </p>
               </div>
               <button
@@ -1528,64 +1551,204 @@ function OSINTResultView({ data }: { data: any }) {
               </button>
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="space-y-6">
               {founders.map((founder: any, idx: number) => {
                 const initials = founder.name
                   ? founder.name.split(' ').map((n: string) => n[0]).slice(0, 2).join('').toUpperCase()
                   : 'LE'
                 const hasDirectLinkedIn = Boolean(founder.linkedin_url && founder.linkedin_url.includes('linkedin.com/in/'))
-                const inferredEmail = founder.inferred_email || `${founder.name?.toLowerCase().replace(/\s+/g, '.')}@${targetDomain}`
+                const inferredEmail = founder.inferred_email || `${founder.name?.toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '')}@${targetDomain}`
+                const photoUrl = founder.photo_url || founder.avatar_url || founder.photo || founder.avatar
+                const bioSummary = founder.bio_summary || founder.bio || ''
+                const biography: Record<string, string> = { ...(founder.biography || {}) }
+                const sourceRefs: any[] = (founder.source_references && founder.source_references.length > 0)
+                  ? founder.source_references
+                  : (Array.isArray(founder.sources)
+                      ? founder.sources.map((s: any) => typeof s === 'string'
+                          ? { name: s, url: s.toLowerCase().includes('linkedin') ? (founder.linkedin_url || '#') : `https://${targetDomain}`, icon: s.toLowerCase().includes('linkedin') ? '💼' : '🌐' }
+                          : s)
+                      : [])
+                const wikiUrl = founder.wikipedia_url || ''
+                const primarySourceUrl = wikiUrl || (sourceRefs.length > 0 ? sourceRefs[0].url : founder.linkedin_url) || ''
+
+                const cleanBioValue = (v: string) => {
+                  if (!v) return ''
+                  return v
+                    .replace(/\[\s*\d+\s*\]/g, '')
+                    .replace(/\u200b/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                }
+
+                if (founder.title && !biography.current_role) {
+                  biography.current_role = `${founder.title}${companyName ? `, ${companyName}` : ''}`
+                }
+
+                const bioRows: { label: string; value: string }[] = []
+                if (biography.born) bioRows.push({ label: 'Born', value: cleanBioValue(biography.born) })
+                if (biography.education || biography.alma_mater) bioRows.push({ label: 'Education', value: cleanBioValue(biography.education || biography.alma_mater || '') })
+                if (biography.early_career) bioRows.push({ label: 'Early career', value: cleanBioValue(biography.early_career) })
+                if (biography.company_founded) bioRows.push({ label: 'Company founded', value: cleanBioValue(biography.company_founded) })
+                if (biography.current_role) bioRows.push({ label: 'Current role', value: cleanBioValue(biography.current_role) })
+                if (biography.recognition || biography.awards) bioRows.push({ label: 'Recognition', value: cleanBioValue(biography.recognition || biography.awards || '') })
+                if (biography.occupation) bioRows.push({ label: 'Occupation', value: cleanBioValue(biography.occupation) })
+                if (biography.nationality) bioRows.push({ label: 'Nationality', value: cleanBioValue(biography.nationality) })
+                if (biography.known_for) bioRows.push({ label: 'Known for', value: cleanBioValue(biography.known_for) })
+                if (biography.net_worth) bioRows.push({ label: 'Net worth', value: cleanBioValue(biography.net_worth) })
+                if (biography.spouse) bioRows.push({ label: 'Spouse', value: cleanBioValue(biography.spouse) })
+                if (biography.children) bioRows.push({ label: 'Children', value: cleanBioValue(biography.children) })
+
+                const hasBio = bioRows.length > 0
 
                 return (
                   <div
                     key={idx}
-                    className="rounded-2xl border border-surface-800 bg-gradient-to-br from-surface-900/90 via-surface-900/60 to-surface-950/90 p-5 space-y-4 hover:border-amber-500/40 transition-all shadow-xl"
+                    className="rounded-2xl border border-surface-800 bg-gradient-to-br from-surface-900/90 via-surface-900/60 to-surface-950/90 overflow-hidden hover:border-amber-500/30 transition-all shadow-xl"
                   >
-                    {/* Header: Photo + Name + Verified Source */}
-                    <div className="flex items-start gap-4">
-                      {founder.avatar_url ? (
-                        <img
-                          src={founder.avatar_url}
-                          alt={founder.name}
-                          className="h-14 w-14 rounded-2xl object-cover border border-amber-500/30 bg-surface-950 flex-shrink-0 shadow-md"
-                          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
-                        />
-                      ) : (
-                        <div className="h-14 w-14 rounded-2xl bg-gradient-to-br from-amber-600/30 via-brand-600/20 to-surface-900 border border-amber-500/40 flex items-center justify-center font-bold text-base text-amber-300 flex-shrink-0 shadow-md">
+                    {/* ── Top Section: Photo + Name + Title + Bio ── */}
+                    <div className="p-6 pb-5">
+                      <div className="flex items-start gap-5">
+                        {photoUrl ? (
+                          <img
+                            src={photoUrl}
+                            alt={founder.name}
+                            className="h-[140px] w-[140px] rounded-xl object-cover border-2 border-surface-700 bg-surface-950 flex-shrink-0 shadow-lg"
+                            onError={(e) => {
+                              const img = e.target as HTMLImageElement
+                              img.style.display = 'none'
+                              const fallback = img.nextElementSibling as HTMLElement | null
+                              if (fallback) fallback.style.display = 'flex'
+                            }}
+                          />
+                        ) : null}
+                        <div
+                          className={`h-[140px] w-[140px] rounded-xl bg-gradient-to-br from-amber-600/30 via-brand-600/20 to-surface-900 border-2 border-surface-700 items-center justify-center font-bold text-3xl text-amber-300 flex-shrink-0 shadow-lg ${photoUrl ? 'hidden' : 'flex'}`}
+                        >
                           {initials}
                         </div>
-                      )}
 
-                      <div className="min-w-0 flex-1 space-y-1">
-                        <div className="flex flex-wrap items-center justify-between gap-1">
-                          <h4 className="text-sm font-bold text-white tracking-tight truncate">{founder.name}</h4>
-                          <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[9px] font-bold text-emerald-400 border border-emerald-500/20">
-                            ✓ Verified Scraped
-                          </span>
-                        </div>
-                        <p className="text-xs font-semibold text-amber-400 truncate">
-                          {founder.title}
-                        </p>
-                        <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-                          <span className="rounded-md bg-surface-800 px-2 py-0.5 text-[9px] font-medium text-surface-300 border border-surface-700">
-                            {founder.department || 'Executive Leadership'}
-                          </span>
-                          <span className="text-[10px] text-surface-500 truncate">
-                            Source: {founder.source || 'Website Team Page'}
-                          </span>
+                        <div className="min-w-0 flex-1 space-y-2.5">
+                          <div>
+                            <h4 className="text-2xl font-bold text-white tracking-tight leading-tight">{founder.name}</h4>
+                            <p className="text-sm font-semibold text-brand-400 mt-0.5">
+                              {founder.title}{companyName ? `, ${companyName}` : ''}
+                            </p>
+                          </div>
+
+                          <div className="inline-flex items-center gap-1.5 bg-emerald-500/15 border border-emerald-500/25 rounded-full px-3 py-1">
+                            <svg className="h-4 w-4 text-emerald-400" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
+                            <span className="text-xs font-semibold text-emerald-300">Public-source profile</span>
+                          </div>
+
+                          {bioSummary && (
+                            <p className="text-[13px] text-surface-300 leading-relaxed line-clamp-3">
+                              {bioSummary}
+                            </p>
+                          )}
+
+                          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                            <span className="text-[10px] text-surface-500">
+                              Source: {founder.source || 'Website Team Page'}
+                            </span>
+                            {founder.department && (
+                              <span className="rounded-md bg-surface-800 px-2 py-0.5 text-[9px] font-medium text-surface-300 border border-surface-700">
+                                {founder.department}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </div>
 
-                    {/* Bio snippet if available */}
-                    {founder.bio && (
-                      <p className="text-xs text-surface-300 bg-surface-950/50 p-3 rounded-xl border border-surface-800/80 leading-relaxed">
-                        {founder.bio}
-                      </p>
+                    {/* ── Biography Table ── */}
+                    {hasBio && (
+                      <div className="mx-6 mb-4 rounded-xl border border-surface-800 bg-surface-950/50 overflow-hidden">
+                        <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-800">
+                          <span className="text-base">📋</span>
+                          <span className="text-xs font-bold uppercase tracking-wider text-surface-300">Biography</span>
+                        </div>
+                        <div className="divide-y divide-surface-800/60">
+                          {bioRows.map((row, rowIdx) => (
+                            <div key={rowIdx} className="flex">
+                              <div className="w-[160px] flex-shrink-0 px-4 py-2.5 bg-surface-900/40">
+                                <span className="text-xs font-semibold text-surface-400">{row.label}</span>
+                              </div>
+                              <div className="flex-1 px-4 py-2.5">
+                                <span className="text-xs text-surface-200">{row.value}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     )}
 
-                    {/* Inline Threat & Footprint Analysis Box */}
-                    <div className="rounded-xl border border-surface-800 bg-surface-950/70 p-3.5 space-y-2.5">
+                    {/* ── OSINT Source References ── */}
+                    {(sourceRefs.length > 0 || wikiUrl || founder.linkedin_url || founder.linkedin_search_url) && (
+                      <div className="mx-6 mb-4 rounded-xl border border-surface-800 bg-surface-950/50 overflow-hidden">
+                        <div className="flex items-center justify-between px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <span className="text-base">🔗</span>
+                            <span className="text-xs font-bold uppercase tracking-wider text-surface-300">OSINT Source References</span>
+                          </div>
+                          {primarySourceUrl && (
+                            <a
+                              href={primarySourceUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-400 hover:text-blue-300 transition-colors"
+                            >
+                              View source <ExternalLink className="h-3 w-3" />
+                            </a>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap gap-2 px-4 pb-3.5">
+                          {wikiUrl && (
+                            <a
+                              href={wikiUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-2 rounded-lg bg-blue-600/15 border border-blue-500/25 px-3 py-1.5 text-[11px] font-semibold text-blue-300 hover:bg-blue-600/25 transition-colors"
+                            >
+                              <span>🌐</span> Wikipedia
+                            </a>
+                          )}
+                          {sourceRefs.map((ref: any, refIdx: number) => (
+                            <a
+                              key={refIdx}
+                              href={ref.url || '#'}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-2 rounded-lg bg-purple-600/15 border border-purple-500/25 px-3 py-1.5 text-[11px] font-semibold text-purple-300 hover:bg-purple-600/25 transition-colors"
+                            >
+                              <span>{ref.icon || '🏛️'}</span> {ref.name}
+                            </a>
+                          ))}
+                          {hasDirectLinkedIn && (
+                            <a
+                              href={founder.linkedin_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-2 rounded-lg bg-blue-600/15 border border-blue-500/25 px-3 py-1.5 text-[11px] font-semibold text-blue-300 hover:bg-blue-600/25 transition-colors"
+                            >
+                              <span>💼</span> LinkedIn Profile
+                            </a>
+                          )}
+                          {!hasDirectLinkedIn && founder.linkedin_search_url && (
+                            <a
+                              href={founder.linkedin_search_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-2 rounded-lg bg-surface-800 border border-surface-700 px-3 py-1.5 text-[11px] font-semibold text-surface-300 hover:bg-surface-700 transition-colors"
+                            >
+                              <span>🔍</span> LinkedIn Search
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── Bottom OSINT Row: Inferred Email + Risk ── */}
+                    <div className="mx-6 mb-5 rounded-xl border border-surface-800 bg-surface-950/70 p-3.5 space-y-2.5">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-surface-400 flex items-center gap-1">
                           <ShieldAlert className="h-3 w-3 text-red-400" /> OSINT Risk Profile
@@ -1595,7 +1758,6 @@ function OSINTResultView({ data }: { data: any }) {
                         </span>
                       </div>
 
-                      {/* Inferred Email with Copy */}
                       <div className="flex items-center justify-between gap-2 bg-surface-900/80 p-2 rounded-lg border border-surface-800 text-xs">
                         <div className="flex items-center gap-1.5 min-w-0">
                           <Mail className="h-3.5 w-3.5 text-brand-400 flex-shrink-0" />
@@ -1609,34 +1771,6 @@ function OSINTResultView({ data }: { data: any }) {
                           {copiedKey === `email-${idx}` ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
                           <span>{copiedKey === `email-${idx}` ? 'Copied' : 'Copy'}</span>
                         </button>
-                      </div>
-
-                      {/* Direct LinkedIn Profile vs Search */}
-                      <div className="flex items-center justify-between gap-2 pt-1 text-xs">
-                        <span className="text-[11px] text-surface-400 flex items-center gap-1">
-                          <span>💼</span> LinkedIn Identity:
-                        </span>
-                        {hasDirectLinkedIn ? (
-                          <a
-                            href={founder.linkedin_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 font-semibold text-blue-400 hover:text-blue-300 text-[11px] bg-blue-500/10 border border-blue-500/20 px-2.5 py-1 rounded-lg transition-colors"
-                          >
-                            <span>Direct Profile Found</span>
-                            <ExternalLink className="h-3 w-3" />
-                          </a>
-                        ) : (
-                          <a
-                            href={founder.linkedin_search_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 text-surface-400 hover:text-blue-300 text-[11px] transition-colors"
-                          >
-                            <span>Search Profile</span>
-                            <ExternalLink className="h-3 w-3" />
-                          </a>
-                        )}
                       </div>
                     </div>
                   </div>

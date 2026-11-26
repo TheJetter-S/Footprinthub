@@ -139,5 +139,45 @@ class TestAboutFounderExtraction(unittest.TestCase):
         self.assertEqual(len(intel["founders"]), 1)
         self.assertEqual(len(intel["employees"]), 3)
 
+    def test_spa_js_bundle_and_regional_socials_extraction(self):
+        from app.modules.osint_helpers import SocialMediaScraper
+
+        js_bundle = """
+        const socials = [
+            {name:"LinkedIn",to:"https://in.linkedin.com/company/auriseg"},
+            {name:"Pinterest",to:"https://in.pinterest.com/Auriseg2013/"},
+            {name:"Facebook",to:"https://www.facebook.com/people/Auriseg/61551413094675/"},
+            {name:"Instagram",to:"https://www.instagram.com/auriseg_cybersecurity/"},
+            {name:"X",to:"https://x.com/auriseg"},
+            {name:"YouTube",to:"https://youtube.com/@auriseg?si=abc"}
+        ];
+        const offices = [{city:"Chennai - Head Quarters",address:"3rd floor, Workez, Chennai 600043"}];
+        const team = [
+            {id:1,photo:"/images/About Us/team/Srini - Photo.png",name:"Srinivasan M. S.",role:"Founder & CEO",tag:"Leadership",linkedin:"https://www.linkedin.com/in/srinivasan-m-s-5690831a0"},
+            {id:2,photo:"/images/About Us/team/Saranya - Photo.png",name:"Saranya Srinivasan",role:"Co-Founder",tag:"Leadership",linkedin:"https://www.linkedin.com/in/saranyaauriseg"},
+            {id:3,photo:"/images/About Us/team/Thomson.png",name:"Thomson Yeshwanth J M",role:"Manager - SOC",tag:"Cybersecurity",linkedin:"https://www.linkedin.com/in/j-m-thomson-yeshwanth-858164223"}
+        ];
+        const customerTestimonial = {name:"Diksha Vohra",role:"Founder & CEO, <span>Digital by DV, Dubai, UAE.</span>"};
+        const story = {children:"In 2013, Auriseg was founded with the idea that cybersecurity should be proactive, not reactive."};
+        """
+        socials = SocialMediaScraper.extract_social_links(js_bundle)
+        platforms = {s["platform"] for s in socials}
+        self.assertIn("LinkedIn", platforms)
+        self.assertIn("Pinterest", platforms)
+        self.assertIn("Facebook", platforms)
+        self.assertIn("Instagram", platforms)
+        self.assertIn("Twitter / X", platforms)
+        self.assertIn("YouTube", platforms)
+
+        meta = CompanyMetadataScraper.extract_company_metadata("<html><body><div id='root'></div></body></html>", "auriseg.com", "Auriseg", js_bundles=[js_bundle])
+        founder_names = [f["name"] for f in meta["founders"]]
+        self.assertIn("Srinivasan M. S.", founder_names)
+        self.assertIn("Saranya Srinivasan", founder_names)
+        self.assertNotIn("Diksha Vohra", founder_names)
+        self.assertEqual(meta["founded_year"], "2013")
+        self.assertIn("Chennai", meta["headquarters"])
+        srini = next(f for f in meta["founders"] if f["name"] == "Srinivasan M. S.")
+        self.assertEqual(srini["photo_url"], "https://auriseg.com/images/About%20Us/team/Srini%20-%20Photo.png")
+
 if __name__ == "__main__":
     unittest.main()

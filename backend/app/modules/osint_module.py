@@ -23,6 +23,7 @@ from app.modules.osint_helpers import (
     CompanyDigitalFootprintEngine,
     WebsiteIntelligenceEngine,
     PublicKnowledgeHarvester,
+    RDAPService,
 )
 from app.modules.base import (
     BaseModule,
@@ -693,12 +694,89 @@ class OSINTModule(BaseModule):
                     if h_text:
                         all_crawled_html += h_text + "\n"
 
+            # ── 2. SPA JS Bundle & Lazy Chunk Crawling (React / Vite / Next.js / Vue) ──
+            crawled_js_list: list[str] = []
+            seen_js_urls: set[str] = set()
+            if all_crawled_html:
+                entry_js_candidates: list[str] = []
+                third_party_noise = (
+                    "googletagmanager", "google-analytics", "gtag", "clarity.ms",
+                    "hotjar", "intercom", "sentry", "doubleclick", "facebook.net",
+                    "googleapis", "gstatic", "cloudflareinsights", "cookiebot", "onetrust",
+                )
+                for m_src in re.finditer(
+                    r'(?:<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']|<link[^>]+rel=["\']modulepreload["\'][^>]+href=["\']([^"\']+\.js[^"\']*)["\'])',
+                    all_crawled_html,
+                    re.I,
+                ):
+                    raw_src = (m_src.group(1) or m_src.group(2) or "").strip()
+                    if not raw_src or any(n in raw_src.lower() for n in third_party_noise):
+                        continue
+                    if raw_src.startswith("//"):
+                        js_url = f"https:{raw_src}"
+                    elif raw_src.startswith("/"):
+                        js_url = f"https://{active_host}{raw_src}"
+                    elif raw_src.startswith("http"):
+                        parsed_js = urllib.parse.urlparse(raw_src)
+                        if base_domain not in parsed_js.netloc.lower():
+                            continue
+                        js_url = raw_src
+                    else:
+                        js_url = f"https://{active_host}/{raw_src}"
+                    if js_url not in seen_js_urls:
+                        seen_js_urls.add(js_url)
+                        entry_js_candidates.append(js_url)
+
+                async def _fetch_js(url: str) -> tuple[str, str]:
+                    try:
+                        r = await client.get(url, timeout=6.0)
+                        if r.status_code == 200 and r.text:
+                            return (url, r.text)
+                    except Exception:
+                        pass
+                    return (url, "")
+
+                if entry_js_candidates:
+                    entry_results = await asyncio.gather(*[_fetch_js(u) for u in entry_js_candidates[:8]])
+                    lazy_chunk_candidates: list[str] = []
+                    high_signal_kw = (
+                        "about", "team", "leader", "founder", "people", "contact",
+                        "company", "story", "footer", "header", "social", "office",
+                        "privacy", "legal", "who", "executive", "management", "overview",
+                    )
+                    for base_js_url, js_body in entry_results:
+                        if not js_body:
+                            continue
+                        crawled_js_list.append(js_body)
+                        # Discover lazy-loaded route chunks referenced inside the entry JS bundle
+                        base_dir = base_js_url.rsplit("/", 1)[0]
+                        for ch_m in re.finditer(r'["\'](\./[a-zA-Z0-9_./-]+\.js|/[a-zA-Z0-9_./-]+\.js|static/chunks/[a-zA-Z0-9_./-]+\.js|assets/[a-zA-Z0-9_./-]+\.js)["\']', js_body):
+                            ch_ref = ch_m.group(1)
+                            if ch_ref.startswith("./"):
+                                ch_url = f"{base_dir}/{ch_ref[2:]}"
+                            elif ch_ref.startswith("/"):
+                                ch_url = f"https://{active_host}{ch_ref}"
+                            else:
+                                ch_url = f"https://{active_host}/{ch_ref}"
+                            if ch_url not in seen_js_urls and any(kw in ch_ref.lower() for kw in high_signal_kw):
+                                seen_js_urls.add(ch_url)
+                                lazy_chunk_candidates.append(ch_url)
+
+                    if lazy_chunk_candidates:
+                        chunk_results = await asyncio.gather(*[_fetch_js(u) for u in lazy_chunk_candidates[:18]])
+                        for _, ch_body in chunk_results:
+                            if ch_body:
+                                crawled_js_list.append(ch_body)
+
             # Normalize all crawled HTML (strip json-escaped slashes \/ and html entities)
             normalized_html = all_crawled_html.replace(r"\/", "/")
             try:
                 normalized_html = html.unescape(normalized_html)
             except Exception:
                 pass
+            all_crawled_js = "\n".join(crawled_js_list)
+            extraction_corpus = normalized_html + ("\n" + all_crawled_js if all_crawled_js else "")
+            domain_root = base_domain.split(".")[0]
 
             def _clean_email(em: str) -> str:
                 em = em.lower().strip()
@@ -706,33 +784,37 @@ class OSINTModule(BaseModule):
                 em = re.sub(r'^(?:u[0-9a-f]{4}|gt|lt|quot|amp)+', '', em)
                 return em.strip("._- ")
 
-            # Extract emails from normalized crawled HTML
-            found = re.findall(rf"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)*{re.escape(base_domain)}", normalized_html, re.I)
+            # Extract emails from normalized crawled HTML + JS bundles
+            found = re.findall(rf"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)*{re.escape(base_domain)}", extraction_corpus, re.I)
             for e in found:
                 cleaned = _clean_email(e)
                 if "@" in cleaned and len(cleaned.split("@")[0]) > 1:
                     emails_found.add(cleaned)
 
             # Mailto links
-            mailtos = re.findall(r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", normalized_html, re.I)
+            mailtos = re.findall(r"mailto:([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", extraction_corpus, re.I)
             for m in mailtos:
                 clean_m = _clean_email(m)
-                if base_domain in clean_m and "@" in clean_m and len(clean_m.split("@")[0]) > 1:
+                em_domain = clean_m.split("@")[-1] if "@" in clean_m else ""
+                if (base_domain in em_domain or (len(domain_root) >= 4 and domain_root in em_domain)) and len(clean_m.split("@")[0]) > 1:
                     emails_found.add(clean_m)
 
-            general = re.findall(r"(?:info|contact|support|security|sales|admin|team|hello|founder|techsupport)@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", normalized_html, re.I)
+            general = re.findall(r"(?:info|contact|support|security|sales|admin|team|hello|founder|techsupport|marketing)@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", extraction_corpus, re.I)
             for g in general:
                 clean_g = _clean_email(g)
-                if base_domain in clean_g and "@" in clean_g and len(clean_g.split("@")[0]) > 1:
+                em_domain = clean_g.split("@")[-1] if "@" in clean_g else ""
+                if (base_domain in em_domain or (len(domain_root) >= 4 and domain_root in em_domain)) and len(clean_g.split("@")[0]) > 1:
                     emails_found.add(clean_g)
 
-            # ── Extract Social Media Profiles from Website HTML ─────────────────
+            # ── Extract Social Media Profiles from Website HTML & JS Bundles ─────
             self._progress(on_progress, 20, "Extracting official social media profiles from website...")
-            website_social_profiles = SocialMediaScraper.extract_social_links(normalized_html)
+            website_social_profiles = SocialMediaScraper.extract_social_links(extraction_corpus)
 
             # ── Extract Company Metadata, JSON-LD & Team Members ───────────────
             self._progress(on_progress, 25, "Parsing company metadata, schema registers & leadership...")
-            company_meta = CompanyMetadataScraper.extract_company_metadata(normalized_html, base_domain, company_name)
+            company_meta = CompanyMetadataScraper.extract_company_metadata(
+                normalized_html, base_domain, company_name, js_bundles=crawled_js_list
+            )
             if company_meta.get("name") and company_meta["name"] != company_name:
                 company_name = company_meta["name"]
 
@@ -743,15 +825,26 @@ class OSINTModule(BaseModule):
             # Query open knowledge repositories (Wikipedia, Wikidata & public graphs)
             wiki_intel: dict[str, Any] = {}
             try:
-                self._progress(on_progress, 28, f"Querying open knowledge bases for {company_name}...")
-                wiki_intel = await PublicKnowledgeHarvester.harvest_public_knowledge(company_name, base_domain, client=client)
+                self._progress(on_progress, 28, f"Querying Wikipedia & Wikidata for {company_name}...")
+                wiki_intel = await PublicKnowledgeHarvester.harvest_public_knowledge(
+                    company_name, base_domain, client=client, legal_name=company_meta.get("legal_name", "")
+                )
                 if wiki_intel.get("description") and not company_meta.get("description"):
                     company_meta["description"] = wiki_intel["description"]
-                if wiki_intel.get("industry") and not company_meta.get("industry"):
+                if wiki_intel.get("industry") and (not company_meta.get("industry") or company_meta.get("industry") == "Technology & Software"):
                     company_meta["industry"] = wiki_intel["industry"]
                 if wiki_intel.get("headquarters") and not company_meta.get("headquarters"):
                     company_meta["headquarters"] = wiki_intel["headquarters"]
-                if wiki_intel.get("estimated_employees") and not company_meta.get("estimated_employees"):
+                if wiki_intel.get("founded_year") and (
+                    not company_meta.get("founded_year") or company_meta.get("founded_source") == "copyright"
+                ):
+                    company_meta["founded_year"] = wiki_intel["founded_year"]
+                    company_meta["founded_source"] = "wikipedia"
+                if wiki_intel.get("source_url"):
+                    company_meta["wikipedia_url"] = wiki_intel["source_url"]
+                if wiki_intel.get("wikidata_id"):
+                    company_meta["wikidata_id"] = wiki_intel["wikidata_id"]
+                if wiki_intel.get("estimated_employees") and (not company_meta.get("estimated_employees") or company_meta.get("estimated_employees") == "11-50 employees"):
                     company_meta["estimated_employees"] = wiki_intel["estimated_employees"]
                 for f in wiki_intel.get("founders", []):
                     existing = next((ef for ef in company_meta.get("founders", []) if ef.get("name", "").lower() == f.get("name", "").lower()), None)
@@ -760,23 +853,56 @@ class OSINTModule(BaseModule):
                             if v and not existing.get(k):
                                 existing[k] = v
                     else:
-                        company_meta.setdefault("founders", []).append(f)
+                        company_meta.setdefault("founders", []).insert(0, f)
                 if wiki_intel.get("candidate_slugs"):
                     company_meta.setdefault("candidate_slugs", []).extend(wiki_intel["candidate_slugs"])
             except Exception:
                 pass
 
-            # Enrich discovered founders with executive portrait discovery if missing photo
+            # Enrich discovered founders via Wikipedia person profiles and portrait lookup
             if company_meta.get("founders"):
-                for f in company_meta["founders"][:4]:
-                    if not f.get("photo_url"):
-                        try:
-                            f_img = await PublicKnowledgeHarvester.search_person_image(f["name"], company_name, client=client)
+                async def _enrich_founder(f_obj: dict[str, Any]) -> None:
+                    try:
+                        if not f_obj.get("wikipedia_url"):
+                            p_prof = await PublicKnowledgeHarvester.enrich_person_profile(
+                                f_obj["name"], company_name, domain=base_domain, client=client
+                            )
+                            if isinstance(p_prof, dict):
+                                for k in ("wikipedia_url", "bio_summary"):
+                                    if p_prof.get(k) and not f_obj.get(k):
+                                        f_obj[k] = p_prof[k]
+                                if p_prof.get("biography"):
+                                    merged_bio = dict(p_prof["biography"])
+                                    merged_bio.update(f_obj.get("biography") or {})
+                                    f_obj["biography"] = merged_bio
+                                if p_prof.get("source_references"):
+                                    existing_urls = {r.get("url") for r in (f_obj.get("source_references") or [])}
+                                    for ref in p_prof["source_references"]:
+                                        if ref.get("url") not in existing_urls:
+                                            f_obj.setdefault("source_references", []).append(ref)
+                                if not f_obj.get("photo_url") and p_prof.get("photo_url"):
+                                    f_obj["photo_url"] = p_prof["photo_url"]
+                                    f_obj["avatar_url"] = p_prof["photo_url"]
+                        if not f_obj.get("photo_url"):
+                            f_img = await PublicKnowledgeHarvester.search_person_image(f_obj["name"], company_name, client=client)
                             if f_img:
-                                f["photo_url"] = f_img
-                                f["avatar_url"] = f_img
-                        except Exception:
-                            pass
+                                f_obj["photo_url"] = f_img
+                                f_obj["avatar_url"] = f_img
+                    except Exception:
+                        pass
+
+                await asyncio.gather(*[_enrich_founder(f) for f in company_meta["founders"][:4]])
+
+            # Fallback founded_year from RDAP domain registration if still missing
+            if not company_meta.get("founded_year"):
+                try:
+                    rdap_info = await RDAPService.query_rdap(base_domain, client=client)
+                    if rdap_info.get("registered_date"):
+                        ym = re.search(r"(19\d\d|20\d\d)", str(rdap_info["registered_date"]))
+                        if ym:
+                            company_meta["founded_year"] = f"{ym.group(1)} (Domain Reg.)"
+                except Exception:
+                    pass
 
             # Merge any contact emails discovered in company_meta into emails_found
             for c_em in company_meta.get("contact_emails", []):
