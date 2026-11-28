@@ -6,6 +6,7 @@
 # =============================================================================
 
 import asyncio
+import re
 import socket
 from typing import Any, Optional
 import httpx
@@ -42,6 +43,12 @@ TOP_PORTS = [
     {"port": 9200, "service": "Elasticsearch", "severity": FindingSeverity.CRITICAL, "msg": "Elasticsearch cluster port exposed to internet."},
     {"port": 27017, "service": "MongoDB", "severity": FindingSeverity.CRITICAL, "msg": "MongoDB NoSQL database port exposed to internet."},
 ]
+
+CURATED_TOP_PORTS = TOP_PORTS
+
+def _clean_banner(banner: str) -> str:
+    """Clean and sanitize raw socket banners."""
+    return re.sub(r"[\r\n\x00-\x1f\x7f-\x9f]+", " ", banner).strip()
 
 
 class PortsModule(BaseModule):

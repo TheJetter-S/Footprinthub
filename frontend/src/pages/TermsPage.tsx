@@ -3,7 +3,7 @@
 // =============================================================================
 
 import { Link } from 'react-router-dom'
-import { Shield, ArrowLeft } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 
 export default function TermsPage() {
   return (
@@ -18,7 +18,7 @@ export default function TermsPage() {
 
       <div className="glass-card p-8 sm:p-12">
         <div className="flex items-center gap-3 mb-8">
-          <Shield className="h-8 w-8 text-brand-500" />
+          <img src="/footprinthub-icon.svg" alt="FootprintHub" className="h-9 w-9 object-contain" />
           <h1 className="text-2xl font-bold text-surface-100">Terms of Use</h1>
         </div>
 

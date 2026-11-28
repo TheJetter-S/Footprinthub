@@ -4,7 +4,7 @@
 
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Shield, Eye, EyeOff, ArrowRight, Loader2, CheckCircle2 } from 'lucide-react'
+import { Eye, EyeOff, ArrowRight, Loader2, CheckCircle2 } from 'lucide-react'
 import { authApi, ApiError } from '../api/client'
 
 interface RegisterPageProps {
@@ -45,9 +45,11 @@ export default function RegisterPage({ onLogin }: RegisterPageProps) {
       <div className="w-full max-w-md animate-fade-in">
         {/* Header */}
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-brand-500/10 border border-brand-500/20 mb-4">
-            <Shield className="h-8 w-8 text-brand-500" />
-          </div>
+          <img
+            src="/footprinthub-logo-dark.svg"
+            alt="FootprintHub"
+            className="h-14 w-auto mx-auto mb-4 rounded-xl border border-zinc-800/60"
+          />
           <h1 className="text-2xl font-bold text-surface-100">Create your account</h1>
           <p className="mt-2 text-surface-400">
             Start discovering your digital footprint

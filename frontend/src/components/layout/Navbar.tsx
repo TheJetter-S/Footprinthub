@@ -27,27 +27,14 @@ export default function Navbar({
     <header className="border-b border-zinc-800/60 bg-zinc-950/80 backdrop-blur-md sticky top-0 z-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
         {/* Logo */}
-        <Link to="/" className="flex items-center gap-2 cursor-pointer group">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="24"
-            height="24"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="text-indigo-500 group-hover:text-indigo-400 transition-colors"
-          >
-            <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
-            <path d="M5 3v4" />
-            <path d="M19 17v4" />
-            <path d="M3 5h4" />
-            <path d="M17 19h4" />
-          </svg>
-          <span className="text-zinc-50 font-semibold tracking-tight text-lg">
-            FootprintHub
+        <Link to="/" className="flex items-center gap-2.5 cursor-pointer group">
+          <img
+            src="/footprinthub-icon.svg"
+            alt="FootprintHub"
+            className="h-9 w-9 object-contain transition-transform group-hover:scale-105"
+          />
+          <span className="text-zinc-50 font-bold tracking-tight text-lg">
+            Footprint<span className="text-emerald-400">Hub</span>
           </span>
         </Link>
 

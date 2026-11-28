@@ -67,12 +67,7 @@ export default function PublicReportPage() {
             {branding.logo_url ? (
               <img src={branding.logo_url} alt="Logo" className="h-9 w-auto object-contain rounded" />
             ) : (
-              <div
-                className="w-9 h-9 rounded-lg flex items-center justify-center font-bold text-white shadow"
-                style={{ backgroundColor: branding.accent_color || '#2563eb' }}
-              >
-                🛡️
-              </div>
+              <img src="/footprinthub-icon.svg" alt="FootprintHub" className="w-9 h-9 object-contain" />
             )}
             <div>
               <h1 className="text-lg font-bold text-zinc-100">{branding.company_name || 'FootprintHub Security'}</h1>
